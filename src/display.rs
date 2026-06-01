@@ -1,6 +1,6 @@
 use colored::Colorize;
 
-use crate::api::{Item, SearchHint, SystemInfo, UserDto, VirtualFolder};
+use crate::api::{Item, SearchHint, Session, SystemInfo, UserDto, VirtualFolder};
 
 pub fn print_libraries(libs: &[VirtualFolder]) {
     for lib in libs {
@@ -272,6 +272,45 @@ pub fn print_users(users: &[UserDto]) {
             user.id.dimmed(),
             last.dimmed()
         );
+    }
+}
+
+pub fn print_sessions(sessions: &[Session]) {
+    if sessions.is_empty() {
+        println!("  {}", "No active sessions.".dimmed());
+        return;
+    }
+    for s in sessions {
+        let ctrl = if s.supports_remote_control {
+            "●".green().to_string()
+        } else {
+            "○".dimmed().to_string()
+        };
+        let device = s.device_name.as_deref().unwrap_or("unknown");
+        let client = s.client.as_deref().unwrap_or("");
+        let user = s.user_name.as_deref().unwrap_or("");
+        println!(
+            "  {} {} {} {}",
+            ctrl,
+            device.bold(),
+            format!("[{}]", client).dimmed(),
+            user.dimmed()
+        );
+
+        if let Some(ref np) = s.now_playing_item {
+            let glyph = match &s.play_state {
+                Some(ps) if ps.is_paused => "⏸",
+                _ => "▶",
+            };
+            let tag = format_type_tag(&np.item_type);
+            let title = if let Some(ref series) = np.series_name {
+                format!("{} — {}", series.cyan(), np.name.bold())
+            } else {
+                np.name.bold().to_string()
+            };
+            println!("      {} {} {}", glyph, tag, title);
+        }
+        println!("    {}", s.id.dimmed());
     }
 }
 

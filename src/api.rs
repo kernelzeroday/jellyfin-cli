@@ -202,6 +202,31 @@ pub struct SystemInfo {
     pub local_address: Option<String>,
 }
 
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct Session {
+    pub id: String,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub user_name: Option<String>,
+    #[serde(default)]
+    pub supports_remote_control: bool,
+    #[serde(default)]
+    pub now_playing_item: Option<Item>,
+    #[serde(default)]
+    pub play_state: Option<PlayState>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlayState {
+    #[serde(default)]
+    pub is_paused: bool,
+}
+
 pub fn normalize_item_type(t: &str) -> String {
     match t.to_lowercase().as_str() {
         "movie" | "movies" => "Movie",
@@ -551,6 +576,94 @@ impl Client {
         } else {
             self.delete(&path).send().await?.error_for_status()?;
         }
+        Ok(())
+    }
+
+    // --- Sessions / remote control ---
+
+    pub async fn sessions(&self) -> Result<Vec<Session>> {
+        Ok(self
+            .get("/Sessions")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    pub async fn resolve_session(&self, to: Option<&str>) -> Result<Session> {
+        let controllable: Vec<Session> = self
+            .sessions()
+            .await?
+            .into_iter()
+            .filter(|s| s.supports_remote_control)
+            .collect();
+
+        if controllable.is_empty() {
+            bail!("no controllable device is active — open the Jellyfin app on the device and try again");
+        }
+
+        match to {
+            Some(name) => {
+                let lower = name.to_lowercase();
+                controllable
+                    .into_iter()
+                    .find(|s| {
+                        let dev = s.device_name.as_deref().unwrap_or("").to_lowercase();
+                        let client = s.client.as_deref().unwrap_or("").to_lowercase();
+                        dev.contains(&lower) || client.contains(&lower)
+                    })
+                    .with_context(|| format!("no controllable device matching '{}'", name))
+            }
+            None => {
+                if controllable.len() == 1 {
+                    Ok(controllable.into_iter().next().unwrap())
+                } else {
+                    let names: Vec<String> = controllable
+                        .iter()
+                        .map(|s| {
+                            s.device_name
+                                .clone()
+                                .or_else(|| s.client.clone())
+                                .unwrap_or_else(|| s.id.clone())
+                        })
+                        .collect();
+                    bail!(
+                        "multiple controllable devices — specify --to <name>: {}",
+                        names.join(", ")
+                    )
+                }
+            }
+        }
+    }
+
+    pub async fn play_on_session(
+        &self,
+        session_id: &str,
+        item_id: &str,
+        play_command: &str,
+    ) -> Result<()> {
+        self.post(&format!(
+            "/Sessions/{}/Playing?itemIds={}&playCommand={}",
+            session_id, item_id, play_command
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn playstate_command(
+        &self,
+        session_id: &str,
+        command: &str,
+        position_ticks: Option<u64>,
+    ) -> Result<()> {
+        let mut path = format!("/Sessions/{}/Playing/{}", session_id, command);
+        if let Some(ticks) = position_ticks {
+            path.push_str(&format!("?seekPositionTicks={}", ticks));
+        }
+        self.post(&path).send().await?.error_for_status()?;
         Ok(())
     }
 }

@@ -2,7 +2,7 @@ mod api;
 mod config;
 mod display;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -86,6 +86,28 @@ enum Command {
         #[arg(short, long, value_parser = ["played", "unplayed", "favorite", "unfavorite"])]
         r#as: String,
     },
+    /// List active client sessions (devices you can remote-control)
+    Sessions,
+    /// Cast an item to a device (auto-picks the only controllable device)
+    Cast {
+        /// Item ID or name
+        item: Vec<String>,
+        /// Target device name (substring match); omit to auto-pick
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Remote-control playback on a device
+    Remote {
+        /// Action to send
+        #[arg(value_parser = ["pause", "stop", "next", "prev", "seek"])]
+        action: String,
+        /// Target device name (substring match); omit to auto-pick
+        #[arg(long)]
+        to: Option<String>,
+        /// Seek position in seconds (required for `seek`)
+        #[arg(long)]
+        position: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -106,6 +128,9 @@ async fn main() -> Result<()> {
         Command::Url { item } => cmd_url(item.join(" ")).await,
         Command::Recent { limit } => cmd_recent(limit).await,
         Command::Mark { item, r#as } => cmd_mark(item.join(" "), r#as).await,
+        Command::Sessions => cmd_sessions().await,
+        Command::Cast { item, to } => cmd_cast(item.join(" "), to).await,
+        Command::Remote { action, to, position } => cmd_remote(action, to, position).await,
     }
 }
 
@@ -337,5 +362,66 @@ async fn cmd_mark(item: String, mark_as: String) -> Result<()> {
         _ => unreachable!(),
     }
     println!("Marked {} as {}", id, colored::Colorize::green(mark_as.as_str()));
+    Ok(())
+}
+
+async fn cmd_sessions() -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+    let sessions = client.sessions().await?;
+    display::print_sessions(&sessions);
+    Ok(())
+}
+
+async fn cmd_cast(item: String, to: Option<String>) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+    let id = client.resolve_item_id(&item).await?;
+    let detail = client.item_detail(&id).await?;
+    let session = client.resolve_session(to.as_deref()).await?;
+    client.play_on_session(&session.id, &id, "PlayNow").await?;
+
+    let device = session
+        .device_name
+        .as_deref()
+        .or(session.client.as_deref())
+        .unwrap_or("device");
+    println!(
+        "Casting {} to {}",
+        colored::Colorize::bold(detail.name.as_str()),
+        colored::Colorize::green(device)
+    );
+    Ok(())
+}
+
+async fn cmd_remote(action: String, to: Option<String>, position: Option<u64>) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+    let session = client.resolve_session(to.as_deref()).await?;
+
+    let (command, ticks) = match action.as_str() {
+        "pause" => ("PlayPause", None),
+        "stop" => ("Stop", None),
+        "next" => ("NextTrack", None),
+        "prev" => ("PreviousTrack", None),
+        "seek" => {
+            let secs = position.context("--position <seconds> is required for seek")?;
+            ("Seek", Some(secs * 10_000_000))
+        }
+        _ => unreachable!(),
+    };
+
+    client.playstate_command(&session.id, command, ticks).await?;
+
+    let device = session
+        .device_name
+        .as_deref()
+        .or(session.client.as_deref())
+        .unwrap_or("device");
+    println!(
+        "Sent {} to {}",
+        colored::Colorize::green(action.as_str()),
+        device
+    );
     Ok(())
 }
