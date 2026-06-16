@@ -410,6 +410,71 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
     let detail = client.item_detail(&id).await?;
 
     let token = cfg.access_token.as_deref().unwrap_or("");
+
+    if detail.item_type == "Series" {
+        let episodes = client.episodes(&id, None).await?;
+        if episodes.items.is_empty() {
+            bail!("series has no episodes");
+        }
+
+        let start_index = episodes
+            .items
+            .iter()
+            .position(|ep| ep.user_data.as_ref().map_or(true, |ud| !ud.played))
+            .unwrap_or(0);
+
+        let mut playlist = String::from("#EXTM3U\n");
+        for ep in &episodes.items {
+            let ep_title = format!(
+                "{} S{:02}E{:02} - {}",
+                detail.name,
+                ep.parent_index_number.unwrap_or(0),
+                ep.index_number.unwrap_or(0),
+                ep.name
+            );
+            let duration = ep
+                .run_time_ticks
+                .map(|t| (t / 10_000_000) as i64)
+                .unwrap_or(-1);
+            let url = format!(
+                "{}/Videos/{}/stream?Static=true&api_key={}",
+                cfg.server_url, ep.id, token
+            );
+            playlist.push_str(&format!("#EXTINF:{},{}\n{}\n", duration, ep_title, url));
+        }
+
+        let playlist_path = std::env::temp_dir().join(format!("jf-{}.m3u", id));
+        std::fs::write(&playlist_path, &playlist)?;
+
+        let start_ep = &episodes.items[start_index];
+        let start_title = format!(
+            "{} S{:02}E{:02}",
+            detail.name,
+            start_ep.parent_index_number.unwrap_or(0),
+            start_ep.index_number.unwrap_or(0),
+        );
+        println!(
+            "Playing {} ({} episodes, starting at {}) with mpv...",
+            colored::Colorize::bold(detail.name.as_str()),
+            episodes.items.len(),
+            colored::Colorize::bold(start_title.as_str()),
+        );
+
+        let status = std::process::Command::new("mpv")
+            .arg(format!("--playlist={}", playlist_path.display()))
+            .arg(format!("--playlist-start={}", start_index))
+            .args(&mpv_args)
+            .status()
+            .context("failed to launch mpv — is it installed?")?;
+
+        let _ = std::fs::remove_file(&playlist_path);
+
+        if !status.success() {
+            bail!("mpv exited with {}", status);
+        }
+        return Ok(());
+    }
+
     let url = match detail.item_type.as_str() {
         "Episode" | "Movie" => format!(
             "{}/Videos/{}/stream?Static=true&api_key={}",
