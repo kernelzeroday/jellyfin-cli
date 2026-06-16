@@ -2,7 +2,7 @@ mod api;
 mod config;
 mod display;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -96,6 +96,14 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Play an item locally with mpv
+    Play {
+        /// Item ID or name
+        item: Vec<String>,
+        /// Extra arguments passed to mpv
+        #[arg(last = true)]
+        mpv_args: Vec<String>,
+    },
     /// Remote-control playback on a device
     Remote {
         /// Action to send
@@ -130,6 +138,7 @@ async fn main() -> Result<()> {
         Command::Mark { item, r#as } => cmd_mark(item.join(" "), r#as).await,
         Command::Sessions => cmd_sessions().await,
         Command::Cast { item, to } => cmd_cast(item.join(" "), to).await,
+        Command::Play { item, mpv_args } => cmd_play(item.join(" "), mpv_args).await,
         Command::Remote { action, to, position } => cmd_remote(action, to, position).await,
     }
 }
@@ -391,6 +400,54 @@ async fn cmd_cast(item: String, to: Option<String>) -> Result<()> {
         colored::Colorize::bold(detail.name.as_str()),
         colored::Colorize::green(device)
     );
+    Ok(())
+}
+
+async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+    let id = client.resolve_item_id(&item).await?;
+    let detail = client.item_detail(&id).await?;
+
+    let token = cfg.access_token.as_deref().unwrap_or("");
+    let url = match detail.item_type.as_str() {
+        "Episode" | "Movie" => format!(
+            "{}/Videos/{}/stream?Static=true&api_key={}",
+            cfg.server_url, id, token
+        ),
+        "Audio" => format!(
+            "{}/Audio/{}/stream?Static=true&api_key={}",
+            cfg.server_url, id, token
+        ),
+        _ => format!(
+            "{}/Items/{}/Download?api_key={}",
+            cfg.server_url, id, token
+        ),
+    };
+
+    let title = if let Some(ref series) = detail.series_name {
+        let ep = detail.index_number.map(|e| format!("E{:02}", e)).unwrap_or_default();
+        let sn = detail.parent_index_number.map(|s| format!("S{:02}", s)).unwrap_or_default();
+        format!("{} {}{} - {}", series, sn, ep, detail.name)
+    } else {
+        detail.name.clone()
+    };
+
+    println!(
+        "Playing {} with mpv...",
+        colored::Colorize::bold(title.as_str())
+    );
+
+    let status = std::process::Command::new("mpv")
+        .arg(&url)
+        .arg(format!("--force-media-title={}", title))
+        .args(&mpv_args)
+        .status()
+        .context("failed to launch mpv — is it installed?")?;
+
+    if !status.success() {
+        bail!("mpv exited with {}", status);
+    }
     Ok(())
 }
 
