@@ -48,6 +48,12 @@ enum Command {
         /// Max results
         #[arg(short, long, default_value = "20")]
         limit: u32,
+        /// Filter by year (auto-detected from trailing year in query)
+        #[arg(short, long)]
+        year: Option<u32>,
+        /// Filter by type: movie, series, episode, audio, album, artist
+        #[arg(short = 't', long)]
+        r#type: Option<String>,
     },
     /// Show details for an item by ID or name
     Info {
@@ -116,6 +122,51 @@ enum Command {
         #[arg(long)]
         position: Option<u64>,
     },
+    /// Trigger a library scan (all libraries, or one by name/ID)
+    Scan {
+        /// Library name or ID (omit to scan all libraries)
+        library: Option<String>,
+    },
+    /// Refresh metadata/images for a specific item
+    Refresh {
+        /// Item ID or name
+        item: Vec<String>,
+        /// Force a full metadata re-fetch instead of only missing fields
+        #[arg(long)]
+        metadata: bool,
+        /// Force images to be re-downloaded
+        #[arg(long)]
+        images: bool,
+    },
+    /// Search external metadata providers to (re)identify an item
+    Identify {
+        /// Item ID or name
+        item: Vec<String>,
+        /// Apply the Nth result from the search (1-based)
+        #[arg(long)]
+        apply: Option<usize>,
+        /// Also replace existing images when applying
+        #[arg(long)]
+        replace_images: bool,
+        /// Override the title to search for
+        #[arg(long)]
+        name: Option<String>,
+        /// Override the year to search for
+        #[arg(long)]
+        year: Option<u32>,
+    },
+    /// List scheduled server tasks and their status
+    Tasks,
+    /// Run a scheduled task now (e.g. library scan, plugin task)
+    RunTask {
+        /// Task name (substring match)
+        name: Vec<String>,
+    },
+    /// List missing episodes for a series
+    Missing {
+        /// Series ID or name
+        series: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -128,7 +179,9 @@ async fn main() -> Result<()> {
         Command::List { library, r#type, limit, sort } => {
             cmd_list(library, r#type, limit, sort).await
         }
-        Command::Search { query, limit } => cmd_search(query.join(" "), limit).await,
+        Command::Search { query, limit, year, r#type } => {
+            cmd_search(query.join(" "), limit, year, r#type).await
+        }
         Command::Info { item } => cmd_info(item.join(" ")).await,
         Command::Episodes { series, season } => cmd_episodes(series.join(" "), season).await,
         Command::Users => cmd_users().await,
@@ -140,6 +193,16 @@ async fn main() -> Result<()> {
         Command::Cast { item, to } => cmd_cast(item.join(" "), to).await,
         Command::Play { item, mpv_args } => cmd_play(item.join(" "), mpv_args).await,
         Command::Remote { action, to, position } => cmd_remote(action, to, position).await,
+        Command::Scan { library } => cmd_scan(library).await,
+        Command::Refresh { item, metadata, images } => {
+            cmd_refresh(item.join(" "), metadata, images).await
+        }
+        Command::Identify { item, apply, replace_images, name, year } => {
+            cmd_identify(item.join(" "), apply, replace_images, name, year).await
+        }
+        Command::Tasks => cmd_tasks().await,
+        Command::RunTask { name } => cmd_run_task(name.join(" ")).await,
+        Command::Missing { series } => cmd_missing(series.join(" ")).await,
     }
 }
 
@@ -277,11 +340,38 @@ async fn cmd_list(
     Ok(())
 }
 
-async fn cmd_search(query: String, limit: u32) -> Result<()> {
+async fn cmd_search(
+    query: String,
+    limit: u32,
+    year: Option<u32>,
+    item_type: Option<String>,
+) -> Result<()> {
     let cfg = config::Config::load()?;
     let client = api::Client::new(&cfg)?;
-    let hints = client.search(&query, limit).await?;
-    display::print_search_results(&hints, &cfg.server_url);
+
+    let (search_term, year_filter) = match year {
+        Some(y) => (query, Some(y)),
+        None => api::extract_trailing_year(&query),
+    };
+
+    let jf_type = item_type.as_deref().map(api::normalize_item_type);
+    let filtering = year_filter.is_some() || jf_type.is_some();
+    let api_limit = if filtering { limit.max(100) } else { limit };
+
+    let hints = client
+        .search(&search_term, api_limit, jf_type.as_deref())
+        .await?;
+
+    let filtered: Vec<_> = hints
+        .into_iter()
+        .filter(|h| match year_filter {
+            Some(y) => h.production_year == Some(y),
+            None => true,
+        })
+        .take(limit as usize)
+        .collect();
+
+    display::print_search_results(&filtered, &cfg.server_url);
     Ok(())
 }
 
@@ -545,5 +635,172 @@ async fn cmd_remote(action: String, to: Option<String>, position: Option<u64>) -
         colored::Colorize::green(action.as_str()),
         device
     );
+    Ok(())
+}
+
+async fn cmd_scan(library: Option<String>) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+
+    match library {
+        Some(name) => {
+            let id = client.resolve_library_id(&name).await?;
+            client.refresh_item(&id, "Default", "Default", false, false).await?;
+            println!(
+                "Triggered rescan for {}",
+                colored::Colorize::green(name.as_str())
+            );
+        }
+        None => {
+            client.refresh_all_libraries().await?;
+            println!(
+                "Triggered rescan for {}",
+                colored::Colorize::green("all libraries")
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_refresh(item: String, metadata: bool, images: bool) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+    let id = client.resolve_item_id(&item).await?;
+    let detail = client.item_detail(&id).await?;
+
+    let metadata_mode = if metadata { "FullRefresh" } else { "Default" };
+    let image_mode = if images { "FullRefresh" } else { "Default" };
+    client
+        .refresh_item(&id, metadata_mode, image_mode, metadata, images)
+        .await?;
+
+    println!(
+        "Queued refresh for {}",
+        colored::Colorize::bold(detail.name.as_str())
+    );
+    Ok(())
+}
+
+async fn cmd_identify(
+    item: String,
+    apply: Option<usize>,
+    replace_images: bool,
+    name_override: Option<String>,
+    year_override: Option<u32>,
+) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+    let id = client.resolve_item_id(&item).await?;
+    let detail = client.item_detail(&id).await?;
+
+    let search_type = api::remote_search_type(&detail.item_type)
+        .with_context(|| format!("cannot identify items of type {}", detail.item_type))?;
+
+    let name = name_override.unwrap_or_else(|| detail.name.clone());
+    let year = year_override.or(detail.production_year);
+
+    let results = client.remote_search(search_type, &id, &name, year).await?;
+    if results.is_empty() {
+        println!("{}", colored::Colorize::yellow("No matches found."));
+        return Ok(());
+    }
+
+    if let Some(index) = apply {
+        let chosen = results
+            .get(index - 1)
+            .with_context(|| format!("no result at index {}", index))?;
+        client.apply_remote_search(&id, chosen, replace_images).await?;
+        let chosen_name = chosen.get("Name").and_then(|v| v.as_str()).unwrap_or("match");
+        println!(
+            "Applied {} to {}",
+            colored::Colorize::green(chosen_name),
+            colored::Colorize::bold(detail.name.as_str())
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Matches for {}:",
+        colored::Colorize::bold(detail.name.as_str())
+    );
+    for (i, result) in results.iter().enumerate() {
+        let rname = result.get("Name").and_then(|v| v.as_str()).unwrap_or("?");
+        let ryear = result
+            .get("ProductionYear")
+            .and_then(|v| v.as_u64())
+            .map(|y| format!(" ({})", y))
+            .unwrap_or_default();
+        let providers = result
+            .get("ProviderIds")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| format!("{}:{}", k, v.as_str().unwrap_or("")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+
+        println!(
+            "  {}. {}{}",
+            i + 1,
+            colored::Colorize::bold(rname),
+            colored::Colorize::dimmed(ryear.as_str())
+        );
+        if !providers.is_empty() {
+            println!("     {}", colored::Colorize::dimmed(providers.as_str()));
+        }
+    }
+    println!(
+        "\n  Run again with {} to apply a match",
+        colored::Colorize::cyan("--apply <n>")
+    );
+    Ok(())
+}
+
+async fn cmd_tasks() -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+    let tasks = client.scheduled_tasks().await?;
+    display::print_tasks(&tasks);
+    Ok(())
+}
+
+async fn cmd_run_task(name: String) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+    let id = client.resolve_task_id(&name).await?;
+    client.start_task(&id).await?;
+    println!("Started task {}", colored::Colorize::green(name.as_str()));
+    Ok(())
+}
+
+async fn cmd_missing(series: String) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+    let id = client.resolve_item_id(&series).await?;
+    let detail = client.item_detail(&id).await?;
+    let episodes = client.episodes(&id, None).await?;
+
+    let missing: Vec<_> = episodes
+        .items
+        .into_iter()
+        .filter(|ep| ep.location_type.as_deref() == Some("Virtual"))
+        .collect();
+
+    if missing.is_empty() {
+        println!(
+            "No missing episodes for {}",
+            colored::Colorize::bold(detail.name.as_str())
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Missing episodes for {} ({}):",
+        colored::Colorize::bold(detail.name.as_str()),
+        missing.len()
+    );
+    display::print_items(&missing, &cfg.server_url);
     Ok(())
 }

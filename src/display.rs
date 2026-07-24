@@ -1,6 +1,6 @@
 use colored::Colorize;
 
-use crate::api::{Item, SearchHint, Session, SystemInfo, UserDto, VirtualFolder};
+use crate::api::{Item, SearchHint, Session, SystemInfo, TaskInfo, UserDto, VirtualFolder};
 
 pub fn print_libraries(libs: &[VirtualFolder]) {
     for lib in libs {
@@ -334,6 +334,37 @@ pub fn print_system_info(info: &SystemInfo) {
             "no".to_string()
         }
     );
+}
+
+pub fn print_tasks(tasks: &[TaskInfo]) {
+    for t in tasks {
+        let state = match t.state.as_str() {
+            "Running" => t.state.green().to_string(),
+            "Idle" => t.state.dimmed().to_string(),
+            _ => t.state.yellow().to_string(),
+        };
+        let progress = t
+            .current_progress_percentage
+            .map(|p| format!(" {:.0}%", p))
+            .unwrap_or_default();
+        let category = t.category.as_deref().unwrap_or("");
+
+        println!(
+            "  {} {}{} {}",
+            t.name.bold(),
+            state,
+            progress,
+            format!("[{}]", category).dimmed()
+        );
+
+        if let Some(ref result) = t.last_execution_result {
+            if let Some(ref status) = result.status {
+                let end = result.end_time_utc.as_deref().unwrap_or("");
+                println!("    last run: {} {}", status.dimmed(), end.dimmed());
+            }
+        }
+        println!("    {}", t.id.dimmed());
+    }
 }
 
 fn format_type_tag(t: &str) -> String {

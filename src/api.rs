@@ -114,6 +114,8 @@ pub struct Item {
     pub child_count: Option<u32>,
     #[serde(default)]
     pub recursive_item_count: Option<u32>,
+    #[serde(default)]
+    pub location_type: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -227,6 +229,29 @@ pub struct PlayState {
     pub is_paused: bool,
 }
 
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct TaskInfo {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub current_progress_percentage: Option<f64>,
+    #[serde(default)]
+    pub last_execution_result: Option<TaskExecutionResult>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct TaskExecutionResult {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub end_time_utc: Option<String>,
+}
+
 pub fn normalize_item_type(t: &str) -> String {
     match t.to_lowercase().as_str() {
         "movie" | "movies" => "Movie",
@@ -240,6 +265,20 @@ pub fn normalize_item_type(t: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+/// Maps an item type to its `/Items/RemoteSearch/{Type}` path segment, if identification is supported.
+pub fn remote_search_type(item_type: &str) -> Option<&'static str> {
+    match item_type {
+        "Movie" => Some("Movie"),
+        "Series" => Some("Series"),
+        "Episode" => Some("Episode"),
+        "MusicVideo" => Some("MusicVideo"),
+        "BoxSet" => Some("BoxSet"),
+        "Trailer" => Some("Trailer"),
+        "Person" => Some("Person"),
+        _ => None,
+    }
 }
 
 impl Client {
@@ -472,7 +511,13 @@ impl Client {
         if input.len() == 32 && input.chars().all(|c| c.is_ascii_hexdigit()) {
             return Ok(input.to_string());
         }
-        let hints = self.search(input, 1).await?;
+        let (query, year) = extract_trailing_year(input);
+        let hints = self.search(&query, if year.is_some() { 20 } else { 1 }, None).await?;
+        if let Some(y) = year {
+            if let Some(h) = hints.iter().find(|h| h.production_year == Some(y)) {
+                return Ok(h.id.clone());
+            }
+        }
         match hints.first() {
             Some(h) => Ok(h.id.clone()),
             None => bail!("no item found matching: {}", input),
@@ -481,15 +526,24 @@ impl Client {
 
     // --- Search ---
 
-    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHint>> {
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: u32,
+        include_types: Option<&str>,
+    ) -> Result<Vec<SearchHint>> {
         let user_id = self.user_id.as_deref().unwrap_or("");
+        let mut url = format!(
+            "/Search/Hints?searchTerm={}&Limit={}&UserId={}",
+            urlencoding::encode(query),
+            limit,
+            user_id
+        );
+        if let Some(types) = include_types {
+            url.push_str(&format!("&IncludeItemTypes={}", types));
+        }
         let result: SearchHintResult = self
-            .get(&format!(
-                "/Search/Hints?searchTerm={}&Limit={}&UserId={}",
-                urlencoding(query),
-                limit,
-                user_id
-            ))
+            .get(&url)
             .send()
             .await?
             .error_for_status()?
@@ -517,7 +571,7 @@ impl Client {
     pub async fn episodes(&self, series_id: &str, season: Option<u32>) -> Result<ItemsResult> {
         let user_id = self.user_id.as_deref().unwrap_or("");
         let mut url = format!(
-            "/Shows/{}/Episodes?UserId={}&Fields=Overview,UserData,RunTimeTicks,Container",
+            "/Shows/{}/Episodes?UserId={}&Fields=Overview,UserData,RunTimeTicks,Container,LocationType",
             series_id, user_id
         );
         if let Some(s) = season {
@@ -666,12 +720,116 @@ impl Client {
         self.post(&path).send().await?.error_for_status()?;
         Ok(())
     }
+
+    // --- Library scan / metadata refresh ---
+
+    pub async fn refresh_all_libraries(&self) -> Result<()> {
+        self.post("/Library/Refresh").send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn refresh_item(
+        &self,
+        id: &str,
+        metadata_refresh_mode: &str,
+        image_refresh_mode: &str,
+        replace_metadata: bool,
+        replace_images: bool,
+    ) -> Result<()> {
+        let path = format!(
+            "/Items/{}/Refresh?Recursive=true&MetadataRefreshMode={}&ImageRefreshMode={}&ReplaceAllMetadata={}&ReplaceAllImages={}",
+            id, metadata_refresh_mode, image_refresh_mode, replace_metadata, replace_images
+        );
+        self.post(&path).send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    // --- Remote metadata search / identify ---
+
+    pub async fn remote_search(
+        &self,
+        search_type: &str,
+        item_id: &str,
+        name: &str,
+        year: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut search_info = serde_json::json!({ "Name": name });
+        if let Some(y) = year {
+            search_info["Year"] = serde_json::json!(y);
+        }
+        let body = serde_json::json!({
+            "ItemId": item_id,
+            "SearchInfo": search_info,
+        });
+        Ok(self
+            .post(&format!("/Items/RemoteSearch/{}", search_type))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    pub async fn apply_remote_search(
+        &self,
+        item_id: &str,
+        result: &serde_json::Value,
+        replace_images: bool,
+    ) -> Result<()> {
+        self.post(&format!(
+            "/Items/RemoteSearch/Apply/{}?replaceAllImages={}",
+            item_id, replace_images
+        ))
+        .json(result)
+        .send()
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
+    // --- Scheduled tasks ---
+
+    pub async fn scheduled_tasks(&self) -> Result<Vec<TaskInfo>> {
+        Ok(self
+            .get("/ScheduledTasks")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    pub async fn resolve_task_id(&self, name: &str) -> Result<String> {
+        let tasks = self.scheduled_tasks().await?;
+        let lower = name.to_lowercase();
+        tasks
+            .iter()
+            .find(|t| t.name.to_lowercase() == lower)
+            .or_else(|| tasks.iter().find(|t| t.name.to_lowercase().contains(&lower)))
+            .map(|t| t.id.clone())
+            .with_context(|| format!("no scheduled task matching: {}", name))
+    }
+
+    pub async fn start_task(&self, id: &str) -> Result<()> {
+        self.post(&format!("/ScheduledTasks/Running/{}", id))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
 }
 
-fn urlencoding(s: &str) -> String {
-    s.replace(' ', "%20")
-        .replace('&', "%26")
-        .replace('=', "%3D")
-        .replace('?', "%3F")
-        .replace('#', "%23")
+pub fn extract_trailing_year(query: &str) -> (String, Option<u32>) {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.len() >= 2 {
+        if let Ok(y) = words.last().unwrap().parse::<u32>() {
+            if (1900..=2099).contains(&y) {
+                let trimmed = words[..words.len() - 1].join(" ");
+                return (trimmed, Some(y));
+            }
+        }
+    }
+    (query.to_string(), None)
 }
+
