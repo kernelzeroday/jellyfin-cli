@@ -1,9 +1,11 @@
 mod api;
 mod config;
 mod display;
+mod program;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "jf", about = "Jellyfin CLI")]
@@ -167,6 +169,57 @@ enum Command {
         /// Series ID or name
         series: Vec<String>,
     },
+    /// List, inspect, create, and program playlists
+    Playlist {
+        #[command(subcommand)]
+        command: PlaylistCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaylistCommand {
+    /// List playlists visible to the current user
+    List,
+    /// Show the ordered items in a playlist
+    Show {
+        /// Playlist name or ID
+        playlist: String,
+    },
+    /// Create a playlist from item names or IDs
+    Create {
+        /// New playlist name
+        name: String,
+        /// Item names or IDs (quote names containing spaces)
+        #[arg(required = true)]
+        items: Vec<String>,
+        /// Make the playlist visible to other users
+        #[arg(long)]
+        public: bool,
+    },
+    /// Add items to the end of a playlist
+    Add {
+        /// Playlist name or ID
+        playlist: String,
+        /// Item names or IDs (quote names containing spaces)
+        #[arg(required = true)]
+        items: Vec<String>,
+    },
+    /// Replace a playlist's contents, preserving the playlist itself
+    Replace {
+        /// Playlist name or ID
+        playlist: String,
+        /// Item names or IDs (quote names containing spaces)
+        #[arg(required = true)]
+        items: Vec<String>,
+    },
+    /// Build or update long-form channels from a JSON programming config
+    Program {
+        /// Path to the programming config
+        file: PathBuf,
+        /// Resolve and preview the schedule without changing Jellyfin
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -176,12 +229,18 @@ async fn main() -> Result<()> {
         Command::Login { token, server } => cmd_login(token, server).await,
         Command::Status => cmd_status().await,
         Command::Libraries => cmd_libraries().await,
-        Command::List { library, r#type, limit, sort } => {
-            cmd_list(library, r#type, limit, sort).await
-        }
-        Command::Search { query, limit, year, r#type } => {
-            cmd_search(query.join(" "), limit, year, r#type).await
-        }
+        Command::List {
+            library,
+            r#type,
+            limit,
+            sort,
+        } => cmd_list(library, r#type, limit, sort).await,
+        Command::Search {
+            query,
+            limit,
+            year,
+            r#type,
+        } => cmd_search(query.join(" "), limit, year, r#type).await,
         Command::Info { item } => cmd_info(item.join(" ")).await,
         Command::Episodes { series, season } => cmd_episodes(series.join(" "), season).await,
         Command::Users => cmd_users().await,
@@ -192,17 +251,28 @@ async fn main() -> Result<()> {
         Command::Sessions => cmd_sessions().await,
         Command::Cast { item, to } => cmd_cast(item.join(" "), to).await,
         Command::Play { item, mpv_args } => cmd_play(item.join(" "), mpv_args).await,
-        Command::Remote { action, to, position } => cmd_remote(action, to, position).await,
+        Command::Remote {
+            action,
+            to,
+            position,
+        } => cmd_remote(action, to, position).await,
         Command::Scan { library } => cmd_scan(library).await,
-        Command::Refresh { item, metadata, images } => {
-            cmd_refresh(item.join(" "), metadata, images).await
-        }
-        Command::Identify { item, apply, replace_images, name, year } => {
-            cmd_identify(item.join(" "), apply, replace_images, name, year).await
-        }
+        Command::Refresh {
+            item,
+            metadata,
+            images,
+        } => cmd_refresh(item.join(" "), metadata, images).await,
+        Command::Identify {
+            item,
+            apply,
+            replace_images,
+            name,
+            year,
+        } => cmd_identify(item.join(" "), apply, replace_images, name, year).await,
         Command::Tasks => cmd_tasks().await,
         Command::RunTask { name } => cmd_run_task(name.join(" ")).await,
         Command::Missing { series } => cmd_missing(series.join(" ")).await,
+        Command::Playlist { command } => cmd_playlist(command).await,
     }
 }
 
@@ -266,7 +336,10 @@ async fn cmd_login(token: Option<String>, server: Option<String>) -> Result<()> 
 
 async fn cmd_status() -> Result<()> {
     let cfg = config::Config::load()?;
-    println!("Server: {}", colored::Colorize::cyan(cfg.server_url.as_str()));
+    println!(
+        "Server: {}",
+        colored::Colorize::cyan(cfg.server_url.as_str())
+    );
     match &cfg.access_token {
         Some(_) => {
             let client = api::Client::new(&cfg)?;
@@ -275,9 +348,7 @@ async fn cmd_status() -> Result<()> {
                     println!("Connected: {} v{}", info.server_name, info.version);
                     println!(
                         "User: {}",
-                        colored::Colorize::green(
-                            cfg.user_name.as_deref().unwrap_or("unknown")
-                        )
+                        colored::Colorize::green(cfg.user_name.as_deref().unwrap_or("unknown"))
                     );
                 }
                 Err(_) => {
@@ -355,12 +426,18 @@ async fn cmd_search(
     };
 
     let jf_type = item_type.as_deref().map(api::normalize_item_type);
-    let filtering = year_filter.is_some() || jf_type.is_some();
-    let api_limit = if filtering { limit.max(100) } else { limit };
+    let api_limit = if jf_type.is_some() {
+        limit.max(100)
+    } else {
+        // Mixed searches often return every matching episode before their
+        // parent series, so leave enough room to rank top-level items first.
+        limit.max(500)
+    };
 
-    let hints = client
+    let mut hints = client
         .search(&search_term, api_limit, jf_type.as_deref())
         .await?;
+    api::sort_search_hints(&mut hints, &search_term);
 
     let filtered: Vec<_> = hints
         .into_iter()
@@ -387,7 +464,9 @@ async fn cmd_info(item: String) -> Result<()> {
 async fn cmd_episodes(series: String, season: Option<u32>) -> Result<()> {
     let cfg = config::Config::load()?;
     let client = api::Client::new(&cfg)?;
-    let id = client.resolve_item_id(&series).await?;
+    let id = client
+        .resolve_item_id_of_type(&series, Some("Series"))
+        .await?;
 
     if let Some(season_num) = season {
         let episodes = client.episodes(&id, Some(season_num)).await?;
@@ -422,10 +501,7 @@ async fn cmd_url(item: String) -> Result<()> {
     let detail = client.item_detail(&id).await?;
 
     let token = cfg.access_token.as_deref().unwrap_or("");
-    let stream_url = format!(
-        "{}/Items/{}/Download?api_key={}",
-        cfg.server_url, id, token
-    );
+    let stream_url = format!("{}/Items/{}/Download?api_key={}", cfg.server_url, id, token);
     println!("{}", colored::Colorize::bold("Download URL:"));
     println!("  {}", stream_url);
 
@@ -460,7 +536,11 @@ async fn cmd_mark(item: String, mark_as: String) -> Result<()> {
         "unfavorite" => client.set_favorite(&id, false).await?,
         _ => unreachable!(),
     }
-    println!("Marked {} as {}", id, colored::Colorize::green(mark_as.as_str()));
+    println!(
+        "Marked {} as {}",
+        id,
+        colored::Colorize::green(mark_as.as_str())
+    );
     Ok(())
 }
 
@@ -574,15 +654,18 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
             "{}/Audio/{}/stream?Static=true&api_key={}",
             cfg.server_url, id, token
         ),
-        _ => format!(
-            "{}/Items/{}/Download?api_key={}",
-            cfg.server_url, id, token
-        ),
+        _ => format!("{}/Items/{}/Download?api_key={}", cfg.server_url, id, token),
     };
 
     let title = if let Some(ref series) = detail.series_name {
-        let ep = detail.index_number.map(|e| format!("E{:02}", e)).unwrap_or_default();
-        let sn = detail.parent_index_number.map(|s| format!("S{:02}", s)).unwrap_or_default();
+        let ep = detail
+            .index_number
+            .map(|e| format!("E{:02}", e))
+            .unwrap_or_default();
+        let sn = detail
+            .parent_index_number
+            .map(|s| format!("S{:02}", s))
+            .unwrap_or_default();
         format!("{} {}{} - {}", series, sn, ep, detail.name)
     } else {
         detail.name.clone()
@@ -623,7 +706,9 @@ async fn cmd_remote(action: String, to: Option<String>, position: Option<u64>) -
         _ => unreachable!(),
     };
 
-    client.playstate_command(&session.id, command, ticks).await?;
+    client
+        .playstate_command(&session.id, command, ticks)
+        .await?;
 
     let device = session
         .device_name
@@ -645,7 +730,9 @@ async fn cmd_scan(library: Option<String>) -> Result<()> {
     match library {
         Some(name) => {
             let id = client.resolve_library_id(&name).await?;
-            client.refresh_item(&id, "Default", "Default", false, false).await?;
+            client
+                .refresh_item(&id, "Default", "Default", false, false)
+                .await?;
             println!(
                 "Triggered rescan for {}",
                 colored::Colorize::green(name.as_str())
@@ -709,8 +796,13 @@ async fn cmd_identify(
         let chosen = results
             .get(index - 1)
             .with_context(|| format!("no result at index {}", index))?;
-        client.apply_remote_search(&id, chosen, replace_images).await?;
-        let chosen_name = chosen.get("Name").and_then(|v| v.as_str()).unwrap_or("match");
+        client
+            .apply_remote_search(&id, chosen, replace_images)
+            .await?;
+        let chosen_name = chosen
+            .get("Name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("match");
         println!(
             "Applied {} to {}",
             colored::Colorize::green(chosen_name),
@@ -778,7 +870,9 @@ async fn cmd_run_task(name: String) -> Result<()> {
 async fn cmd_missing(series: String) -> Result<()> {
     let cfg = config::Config::load()?;
     let client = api::Client::new(&cfg)?;
-    let id = client.resolve_item_id(&series).await?;
+    let id = client
+        .resolve_item_id_of_type(&series, Some("Series"))
+        .await?;
     let detail = client.item_detail(&id).await?;
     let episodes = client.episodes(&id, None).await?;
 
@@ -803,4 +897,165 @@ async fn cmd_missing(series: String) -> Result<()> {
     );
     display::print_items(&missing, &cfg.server_url);
     Ok(())
+}
+
+async fn cmd_playlist(command: PlaylistCommand) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+
+    match command {
+        PlaylistCommand::List => {
+            let playlists = client.playlists().await?;
+            if playlists.items.is_empty() {
+                println!("{}", colored::Colorize::yellow("No playlists found."));
+            } else {
+                display::print_items(&playlists.items, &cfg.server_url);
+            }
+        }
+        PlaylistCommand::Show { playlist } => {
+            let id = client.resolve_playlist_id(&playlist).await?;
+            let detail = client.item_detail(&id).await?;
+            let items = client.playlist_items(&id).await?;
+            println!(
+                "{} ({} items, {:.1} hours)",
+                colored::Colorize::bold(detail.name.as_str()),
+                items.items.len(),
+                program::ticks_to_hours(
+                    items
+                        .items
+                        .iter()
+                        .filter_map(|item| item.run_time_ticks)
+                        .sum()
+                )
+            );
+            display::print_items(&items.items, &cfg.server_url);
+        }
+        PlaylistCommand::Create {
+            name,
+            items,
+            public,
+        } => {
+            if client
+                .playlists()
+                .await?
+                .items
+                .iter()
+                .any(|playlist| playlist.name.eq_ignore_ascii_case(&name))
+            {
+                bail!(
+                    "playlist '{}' already exists; use `jf playlist replace`",
+                    name
+                );
+            }
+            let ids = resolve_item_ids(&client, &items).await?;
+            let id = client.create_playlist(&name, &ids, public).await?;
+            println!(
+                "Created {} with {} items ({})",
+                colored::Colorize::green(name.as_str()),
+                ids.len(),
+                id
+            );
+        }
+        PlaylistCommand::Add { playlist, items } => {
+            let playlist_id = client.resolve_playlist_id(&playlist).await?;
+            let ids = resolve_item_ids(&client, &items).await?;
+            client.add_playlist_items(&playlist_id, &ids).await?;
+            println!(
+                "Added {} items to {}",
+                ids.len(),
+                colored::Colorize::green(playlist.as_str())
+            );
+        }
+        PlaylistCommand::Replace { playlist, items } => {
+            let playlist_id = client.resolve_playlist_id(&playlist).await?;
+            let ids = resolve_item_ids(&client, &items).await?;
+            client.replace_playlist_items(&playlist_id, &ids).await?;
+            println!(
+                "Replaced {} with {} items",
+                colored::Colorize::green(playlist.as_str()),
+                ids.len()
+            );
+        }
+        PlaylistCommand::Program { file, dry_run } => {
+            let config = program::ProgramConfig::load(&file)?;
+            let mut channels = Vec::with_capacity(config.channels.len());
+
+            println!(
+                "Building {} channel schedules from {}...",
+                config.channels.len(),
+                file.display()
+            );
+            for spec in &config.channels {
+                let channel = program::build_channel(&client, spec).await?;
+                let hours = program::ticks_to_hours(channel.duration_ticks);
+                println!(
+                    "  {}: {} items, {} series, {} movies, {:.1} hours{}",
+                    colored::Colorize::bold(channel.name.as_str()),
+                    channel.items.len(),
+                    channel.series_count,
+                    channel.movie_count,
+                    hours,
+                    if hours + 0.01 < spec.target_hours {
+                        " (library content exhausted before target)"
+                    } else {
+                        ""
+                    }
+                );
+                channels.push(channel);
+            }
+
+            if dry_run {
+                println!(
+                    "{}",
+                    colored::Colorize::yellow("Dry run: Jellyfin was not changed.")
+                );
+                return Ok(());
+            }
+
+            let existing = client.playlists().await?.items;
+            for channel in channels {
+                let item_ids = channel
+                    .items
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>();
+                if let Some(playlist) = existing
+                    .iter()
+                    .find(|playlist| playlist.name.eq_ignore_ascii_case(&channel.name))
+                {
+                    client
+                        .replace_playlist_items(&playlist.id, &item_ids)
+                        .await?;
+                    println!(
+                        "Updated {} in place",
+                        colored::Colorize::green(channel.name.as_str())
+                    );
+                } else {
+                    let id = client
+                        .create_playlist(&channel.name, &item_ids, false)
+                        .await?;
+                    println!(
+                        "Created {} ({})",
+                        colored::Colorize::green(channel.name.as_str()),
+                        id
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn resolve_item_ids(client: &api::Client, items: &[String]) -> Result<Vec<String>> {
+    let mut ids = Vec::with_capacity(items.len());
+    for item in items {
+        ids.push(
+            client
+                .resolve_item_id(item)
+                .await
+                .with_context(|| format!("could not resolve playlist item '{}'", item))?,
+        );
+    }
+    Ok(ids)
 }

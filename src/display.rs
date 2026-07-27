@@ -4,10 +4,7 @@ use crate::api::{Item, SearchHint, Session, SystemInfo, TaskInfo, UserDto, Virtu
 
 pub fn print_libraries(libs: &[VirtualFolder]) {
     for lib in libs {
-        let kind = lib
-            .collection_type
-            .as_deref()
-            .unwrap_or("unknown");
+        let kind = lib.collection_type.as_deref().unwrap_or("unknown");
         println!(
             "  {} {} {}",
             lib.name.bold().cyan(),
@@ -112,11 +109,7 @@ pub fn print_search_results(hints: &[SearchHint], _server_url: &str) {
 
 pub fn print_item_detail(item: &Item, server_url: &str) {
     let type_tag = format_type_tag(&item.item_type);
-    println!(
-        "\n{} {}",
-        type_tag,
-        item.name.bold()
-    );
+    println!("\n{} {}", type_tag, item.name.bold());
 
     if let Some(ref series) = item.series_name {
         let ep = format_episode_number(item.parent_index_number, item.index_number);
@@ -237,11 +230,7 @@ pub fn print_item_detail(item: &Item, server_url: &str) {
             }
             for stream in &src.media_streams {
                 if let Some(ref dt) = stream.display_title {
-                    println!(
-                        "    {}: {}",
-                        stream.stream_type.dimmed(),
-                        dt
-                    );
+                    println!("    {}: {}", stream.stream_type.dimmed(), dt);
                 }
             }
         }
@@ -262,10 +251,7 @@ pub fn print_item_detail(item: &Item, server_url: &str) {
 
 pub fn print_users(users: &[UserDto]) {
     for user in users {
-        let last = user
-            .last_activity_date
-            .as_deref()
-            .unwrap_or("never");
+        let last = user.last_activity_date.as_deref().unwrap_or("never");
         println!(
             "  {} {} last active: {}",
             user.name.bold(),
@@ -378,6 +364,7 @@ fn format_type_tag(t: &str) -> String {
         "MusicArtist" => ("ART", "green"),
         "Book" => ("BOK", "yellow"),
         "BoxSet" => ("SET", "red"),
+        "Playlist" => ("PLY", "yellow"),
         "Person" => ("PER", "white"),
         _ => ("???", "white"),
     };
