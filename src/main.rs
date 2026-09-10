@@ -501,18 +501,24 @@ async fn cmd_url(item: String) -> Result<()> {
     let detail = client.item_detail(&id).await?;
 
     let token = cfg.access_token.as_deref().unwrap_or("");
-    let stream_url = format!("{}/Items/{}/Download?api_key={}", cfg.server_url, id, token);
+    let stream_url = format!("{}/Items/{}/Download", cfg.server_url, id);
     println!("{}", colored::Colorize::bold("Download URL:"));
     println!("  {}", stream_url);
 
     if detail.item_type == "Episode" || detail.item_type == "Movie" {
-        let play_url = format!(
-            "{}/Videos/{}/stream?Static=true&api_key={}",
-            cfg.server_url, id, token
-        );
+        let play_url = format!("{}/Videos/{}/stream?Static=true", cfg.server_url, id);
         println!("{}", colored::Colorize::bold("Stream URL:"));
         println!("  {}", play_url);
     }
+
+    // Jellyfin 12 rejects `?api_key=`; the token has to travel in a header.
+    println!();
+    println!("{}", colored::Colorize::bold("Required header:"));
+    println!("  {}", api::auth_header(token));
+    println!(
+        "  mpv --http-header-fields='{}' <url>",
+        api::auth_header(token)
+    );
     Ok(())
 }
 
@@ -606,10 +612,7 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
                 .run_time_ticks
                 .map(|t| (t / 10_000_000) as i64)
                 .unwrap_or(-1);
-            let url = format!(
-                "{}/Videos/{}/stream?Static=true&api_key={}",
-                cfg.server_url, ep.id, token
-            );
+            let url = format!("{}/Videos/{}/stream?Static=true", cfg.server_url, ep.id);
             playlist.push_str(&format!("#EXTINF:{},{}\n{}\n", duration, ep_title, url));
         }
 
@@ -633,6 +636,7 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
         let status = std::process::Command::new("mpv")
             .arg(format!("--playlist={}", playlist_path.display()))
             .arg(format!("--playlist-start={}", start_index))
+            .arg(api::mpv_auth_arg(token))
             .args(&mpv_args)
             .status()
             .context("failed to launch mpv — is it installed?")?;
@@ -646,15 +650,9 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
     }
 
     let url = match detail.item_type.as_str() {
-        "Episode" | "Movie" => format!(
-            "{}/Videos/{}/stream?Static=true&api_key={}",
-            cfg.server_url, id, token
-        ),
-        "Audio" => format!(
-            "{}/Audio/{}/stream?Static=true&api_key={}",
-            cfg.server_url, id, token
-        ),
-        _ => format!("{}/Items/{}/Download?api_key={}", cfg.server_url, id, token),
+        "Episode" | "Movie" => format!("{}/Videos/{}/stream?Static=true", cfg.server_url, id),
+        "Audio" => format!("{}/Audio/{}/stream?Static=true", cfg.server_url, id),
+        _ => format!("{}/Items/{}/Download", cfg.server_url, id),
     };
 
     let title = if let Some(ref series) = detail.series_name {
@@ -679,6 +677,7 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
     let status = std::process::Command::new("mpv")
         .arg(&url)
         .arg(format!("--force-media-title={}", title))
+        .arg(api::mpv_auth_arg(token))
         .args(&mpv_args)
         .status()
         .context("failed to launch mpv — is it installed?")?;

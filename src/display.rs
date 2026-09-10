@@ -241,11 +241,11 @@ pub fn print_item_detail(item: &Item, server_url: &str) {
     }
 
     println!("\n  ID: {}", item.id.dimmed());
-    let token_hint = "<token>";
     println!(
-        "  Stream: {}/Videos/{}/stream?Static=true&api_key={}",
-        server_url, item.id, token_hint
+        "  Stream: {}/Videos/{}/stream?Static=true",
+        server_url, item.id
     );
+    println!("  Auth:   Authorization: MediaBrowser Token=\"<token>\"");
     println!();
 }
 

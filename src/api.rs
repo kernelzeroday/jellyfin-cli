@@ -287,6 +287,18 @@ pub fn remote_search_type(item_type: &str) -> Option<&'static str> {
     }
 }
 
+/// Jellyfin 12 removed query-string token authentication (`?api_key=`), so media URLs must be
+/// authenticated with this header instead.
+pub fn auth_header(token: &str) -> String {
+    format!("Authorization: MediaBrowser Token=\"{}\"", token)
+}
+
+/// The same header as an mpv option; mpv applies it to every network request it makes,
+/// including the entries of a playlist.
+pub fn mpv_auth_arg(token: &str) -> String {
+    format!("--http-header-fields={}", auth_header(token))
+}
+
 impl Client {
     pub fn new(cfg: &Config) -> Result<Self> {
         let token = cfg
@@ -320,37 +332,31 @@ impl Client {
         )
     }
 
-    fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self
-            .http
-            .get(format!("{}{}", self.base_url, path))
-            .header("X-Emby-Authorization", &self.auth_header);
-        if let Some(ref t) = self.token {
-            req = req.header("X-Emby-Token", t);
+    /// Jellyfin 12 disabled the legacy `X-Emby-*` authorization headers; the supported scheme is a
+    /// single `Authorization: MediaBrowser ...` header, carrying the token when authenticated.
+    fn authorization(&self) -> String {
+        match self.token {
+            Some(ref token) => format!("{}, Token=\"{}\"", self.auth_header, token),
+            None => self.auth_header.clone(),
         }
-        req
+    }
+
+    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http
+            .get(format!("{}{}", self.base_url, path))
+            .header("Authorization", self.authorization())
     }
 
     fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self
-            .http
+        self.http
             .post(format!("{}{}", self.base_url, path))
-            .header("X-Emby-Authorization", &self.auth_header);
-        if let Some(ref t) = self.token {
-            req = req.header("X-Emby-Token", t);
-        }
-        req
+            .header("Authorization", self.authorization())
     }
 
     fn delete(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self
-            .http
+        self.http
             .delete(format!("{}{}", self.base_url, path))
-            .header("X-Emby-Authorization", &self.auth_header);
-        if let Some(ref t) = self.token {
-            req = req.header("X-Emby-Token", t);
-        }
-        req
+            .header("Authorization", self.authorization())
     }
 
     // --- Quick Connect ---
