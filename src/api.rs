@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::config::Config;
@@ -177,7 +177,7 @@ pub struct SearchHintResult {
     pub search_hints: Vec<SearchHint>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct SearchHint {
     pub id: String,
@@ -252,6 +252,12 @@ pub struct TaskExecutionResult {
     pub end_time_utc: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlaylistCreationResult {
+    pub id: String,
+}
+
 pub fn normalize_item_type(t: &str) -> String {
     match t.to_lowercase().as_str() {
         "movie" | "movies" => "Movie",
@@ -281,9 +287,24 @@ pub fn remote_search_type(item_type: &str) -> Option<&'static str> {
     }
 }
 
+/// Jellyfin 12 removed query-string token authentication (`?api_key=`), so media URLs must be
+/// authenticated with this header instead.
+pub fn auth_header(token: &str) -> String {
+    format!("Authorization: MediaBrowser Token=\"{}\"", token)
+}
+
+/// The same header as an mpv option; mpv applies it to every network request it makes,
+/// including the entries of a playlist.
+pub fn mpv_auth_arg(token: &str) -> String {
+    format!("--http-header-fields={}", auth_header(token))
+}
+
 impl Client {
     pub fn new(cfg: &Config) -> Result<Self> {
-        let token = cfg.access_token.as_ref().context("not authenticated — run `jf login`")?;
+        let token = cfg
+            .access_token
+            .as_ref()
+            .context("not authenticated — run `jf login`")?;
         Ok(Self {
             http: reqwest::Client::new(),
             base_url: cfg.server_url.clone(),
@@ -311,37 +332,31 @@ impl Client {
         )
     }
 
-    fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self
-            .http
-            .get(format!("{}{}", self.base_url, path))
-            .header("X-Emby-Authorization", &self.auth_header);
-        if let Some(ref t) = self.token {
-            req = req.header("X-Emby-Token", t);
+    /// Jellyfin 12 disabled the legacy `X-Emby-*` authorization headers; the supported scheme is a
+    /// single `Authorization: MediaBrowser ...` header, carrying the token when authenticated.
+    fn authorization(&self) -> String {
+        match self.token {
+            Some(ref token) => format!("{}, Token=\"{}\"", self.auth_header, token),
+            None => self.auth_header.clone(),
         }
-        req
+    }
+
+    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http
+            .get(format!("{}{}", self.base_url, path))
+            .header("Authorization", self.authorization())
     }
 
     fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self
-            .http
+        self.http
             .post(format!("{}{}", self.base_url, path))
-            .header("X-Emby-Authorization", &self.auth_header);
-        if let Some(ref t) = self.token {
-            req = req.header("X-Emby-Token", t);
-        }
-        req
+            .header("Authorization", self.authorization())
     }
 
     fn delete(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self
-            .http
+        self.http
             .delete(format!("{}{}", self.base_url, path))
-            .header("X-Emby-Authorization", &self.auth_header);
-        if let Some(ref t) = self.token {
-            req = req.header("X-Emby-Token", t);
-        }
-        req
+            .header("Authorization", self.authorization())
     }
 
     // --- Quick Connect ---
@@ -425,10 +440,7 @@ impl Client {
             Err(_) => {
                 let user_id = self.user_id.as_deref().unwrap_or("");
                 let result: ItemsResult = self
-                    .get(&format!(
-                        "/Users/{}/Items?Fields=ChildCount",
-                        user_id
-                    ))
+                    .get(&format!("/Users/{}/Items?Fields=ChildCount", user_id))
                     .send()
                     .await?
                     .error_for_status()?
@@ -455,9 +467,7 @@ impl Client {
         let libs = self.libraries().await?;
         let lower = name.to_lowercase();
         for lib in &libs {
-            if lib.name.to_lowercase() == lower
-                || lib.name.to_lowercase().contains(&lower)
-            {
+            if lib.name.to_lowercase() == lower || lib.name.to_lowercase().contains(&lower) {
                 return Ok(lib.item_id.clone());
             }
         }
@@ -508,20 +518,26 @@ impl Client {
     }
 
     pub async fn resolve_item_id(&self, input: &str) -> Result<String> {
+        self.resolve_item_id_of_type(input, None).await
+    }
+
+    pub async fn resolve_item_id_of_type(
+        &self,
+        input: &str,
+        item_type: Option<&str>,
+    ) -> Result<String> {
         if input.len() == 32 && input.chars().all(|c| c.is_ascii_hexdigit()) {
             return Ok(input.to_string());
         }
         let (query, year) = extract_trailing_year(input);
-        let hints = self.search(&query, if year.is_some() { 20 } else { 1 }, None).await?;
-        if let Some(y) = year {
-            if let Some(h) = hints.iter().find(|h| h.production_year == Some(y)) {
-                return Ok(h.id.clone());
-            }
-        }
-        match hints.first() {
-            Some(h) => Ok(h.id.clone()),
-            None => bail!("no item found matching: {}", input),
-        }
+        // Untyped hint searches can be dominated by hundreds of episodes before
+        // their parent series appears. Typed callers need less headroom, but still
+        // fetch enough candidates to detect same-title remakes safely.
+        let limit = if item_type.is_some() { 100 } else { 500 };
+        let hints = self.search(&query, limit, item_type).await?;
+        select_search_hint(&hints, &query, year, item_type)
+            .map(|hint| hint.id.clone())
+            .with_context(|| format!("could not resolve '{}'", input))
     }
 
     // --- Search ---
@@ -584,6 +600,118 @@ impl Client {
             .error_for_status()?
             .json()
             .await?)
+    }
+
+    // --- Playlists ---
+
+    pub async fn playlists(&self) -> Result<ItemsResult> {
+        let user_id = self.user_id.as_deref().unwrap_or("");
+        Ok(self
+            .get(&format!(
+                "/Users/{}/Items?IncludeItemTypes=Playlist&Recursive=true&Limit=1000&SortBy=SortName&SortOrder=Ascending&Fields=Overview,RunTimeTicks,ChildCount",
+                user_id
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    pub async fn resolve_playlist_id(&self, name: &str) -> Result<String> {
+        if name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(name.to_string());
+        }
+
+        let playlists = self.playlists().await?.items;
+        let lower = name.to_lowercase();
+        playlists
+            .iter()
+            .find(|p| p.name.to_lowercase() == lower)
+            .or_else(|| {
+                playlists
+                    .iter()
+                    .find(|p| p.name.to_lowercase().contains(&lower))
+            })
+            .map(|p| p.id.clone())
+            .with_context(|| format!("no playlist matching: {}", name))
+    }
+
+    pub async fn playlist_items(&self, playlist_id: &str) -> Result<ItemsResult> {
+        let user_id = self.user_id.as_deref().unwrap_or("");
+        Ok(self
+            .get(&format!(
+                "/Playlists/{}/Items?UserId={}&Limit=100000&Fields=RunTimeTicks,Genres,ProductionYear",
+                playlist_id, user_id
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+        item_ids: &[String],
+        public: bool,
+    ) -> Result<String> {
+        let user_id = self
+            .user_id
+            .as_deref()
+            .context("playlist creation requires a user login")?;
+        let body = serde_json::json!({
+            "Name": name,
+            "Ids": item_ids,
+            "UserId": user_id,
+            "MediaType": "Video",
+            "Users": [{
+                "UserId": user_id,
+                "CanEdit": true
+            }],
+            "IsPublic": public
+        });
+        let result: PlaylistCreationResult = self
+            .post("/Playlists")
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(result.id)
+    }
+
+    pub async fn add_playlist_items(&self, playlist_id: &str, item_ids: &[String]) -> Result<()> {
+        let user_id = self
+            .user_id
+            .as_deref()
+            .context("playlist changes require a user login")?;
+        for ids in item_ids.chunks(100) {
+            let joined = ids.join(",");
+            self.post(&format!(
+                "/Playlists/{}/Items?Ids={}&UserId={}",
+                playlist_id, joined, user_id
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+        }
+        Ok(())
+    }
+
+    pub async fn replace_playlist_items(
+        &self,
+        playlist_id: &str,
+        item_ids: &[String],
+    ) -> Result<()> {
+        self.post(&format!("/Playlists/{}", playlist_id))
+            .json(&serde_json::json!({ "Ids": item_ids }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     // --- Latest Items ---
@@ -654,7 +782,9 @@ impl Client {
             .collect();
 
         if controllable.is_empty() {
-            bail!("no controllable device is active — open the Jellyfin app on the device and try again");
+            bail!(
+                "no controllable device is active — open the Jellyfin app on the device and try again"
+            );
         }
 
         match to {
@@ -724,7 +854,10 @@ impl Client {
     // --- Library scan / metadata refresh ---
 
     pub async fn refresh_all_libraries(&self) -> Result<()> {
-        self.post("/Library/Refresh").send().await?.error_for_status()?;
+        self.post("/Library/Refresh")
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -806,7 +939,11 @@ impl Client {
         tasks
             .iter()
             .find(|t| t.name.to_lowercase() == lower)
-            .or_else(|| tasks.iter().find(|t| t.name.to_lowercase().contains(&lower)))
+            .or_else(|| {
+                tasks
+                    .iter()
+                    .find(|t| t.name.to_lowercase().contains(&lower))
+            })
             .map(|t| t.id.clone())
             .with_context(|| format!("no scheduled task matching: {}", name))
     }
@@ -833,3 +970,211 @@ pub fn extract_trailing_year(query: &str) -> (String, Option<u32>) {
     (query.to_string(), None)
 }
 
+fn normalized_search_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn search_type_rank(item_type: &str) -> u8 {
+    match item_type {
+        "Series" | "Movie" | "MusicAlbum" | "MusicArtist" | "BoxSet" | "Playlist" => 0,
+        "Episode" | "Audio" | "Video" | "Book" => 1,
+        _ => 2,
+    }
+}
+
+pub fn sort_search_hints(hints: &mut [SearchHint], query: &str) {
+    let normalized_query = normalized_search_name(query);
+    hints.sort_by_key(|hint| {
+        (
+            normalized_search_name(&hint.name) != normalized_query,
+            search_type_rank(&hint.item_type),
+        )
+    });
+}
+
+fn select_search_hint<'a>(
+    hints: &'a [SearchHint],
+    query: &str,
+    year: Option<u32>,
+    item_type: Option<&str>,
+) -> Result<&'a SearchHint> {
+    let mut candidates = hints
+        .iter()
+        .filter(|hint| {
+            item_type.is_none_or(|wanted| hint.item_type.eq_ignore_ascii_case(wanted))
+                && year.is_none_or(|wanted| hint.production_year == Some(wanted))
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        let type_description = item_type
+            .map(|value| format!(" {}", value))
+            .unwrap_or_default();
+        let year_description = year
+            .map(|value| format!(" from {}", value))
+            .unwrap_or_default();
+        bail!(
+            "no{} item named '{}'{}",
+            type_description,
+            query,
+            year_description
+        );
+    }
+
+    let normalized_query = normalized_search_name(query);
+    let exact = candidates
+        .iter()
+        .copied()
+        .filter(|hint| normalized_search_name(&hint.name) == normalized_query)
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        candidates = exact;
+    }
+
+    let best_type_rank = candidates
+        .iter()
+        .map(|hint| search_type_rank(&hint.item_type))
+        .min()
+        .unwrap_or(u8::MAX);
+    candidates.retain(|hint| search_type_rank(&hint.item_type) == best_type_rank);
+
+    let mut seen_ids = std::collections::HashSet::new();
+    candidates.retain(|hint| seen_ids.insert(hint.id.as_str()));
+    if candidates.len() == 1 {
+        return Ok(candidates[0]);
+    }
+
+    // Jellyfin may expose multiple physical copies of the same logical work.
+    // If every remaining candidate has the same type, normalized title, and
+    // year, choose a stable ID instead of treating equivalent encodes as a
+    // reboot/remake ambiguity.
+    let first = candidates[0];
+    if candidates.iter().all(|hint| {
+        hint.item_type == first.item_type
+            && hint.production_year == first.production_year
+            && normalized_search_name(&hint.name) == normalized_search_name(&first.name)
+    }) {
+        candidates.sort_by_key(|hint| hint.id.as_str());
+        return Ok(candidates[0]);
+    }
+
+    let mut descriptions = candidates
+        .iter()
+        .map(|hint| {
+            format!(
+                "{} '{}'{} ({})",
+                hint.item_type,
+                hint.name,
+                hint.production_year
+                    .map(|value| format!(" {}", value))
+                    .unwrap_or_default(),
+                hint.id
+            )
+        })
+        .collect::<Vec<_>>();
+    descriptions.sort();
+    descriptions.truncate(8);
+    bail!(
+        "ambiguous match for '{}'; use a trailing year, --type where supported, or an item ID. Candidates: {}",
+        query,
+        descriptions.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SearchHint, extract_trailing_year, select_search_hint, sort_search_hints};
+
+    fn hint(id: &str, name: &str, year: u32, item_type: &str) -> SearchHint {
+        SearchHint {
+            id: id.to_string(),
+            name: name.to_string(),
+            item_type: item_type.to_string(),
+            production_year: Some(year),
+            series: None,
+            run_time_ticks: None,
+        }
+    }
+
+    #[test]
+    fn extracts_only_a_plausible_trailing_year() {
+        assert_eq!(
+            extract_trailing_year("Urusei Yatsura 2022"),
+            ("Urusei Yatsura".to_string(), Some(2022))
+        );
+        assert_eq!(
+            extract_trailing_year("2001: A Space Odyssey"),
+            ("2001: A Space Odyssey".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn typed_year_resolution_selects_the_requested_reboot() {
+        let hints = vec![
+            hint("new", "Urusei Yatsura", 2022, "Series"),
+            hint("old", "Urusei Yatsura", 1981, "Series"),
+        ];
+        let selected =
+            select_search_hint(&hints, "Urusei Yatsura", Some(1981), Some("Series")).unwrap();
+        assert_eq!(selected.id, "old");
+    }
+
+    #[test]
+    fn explicit_missing_year_does_not_fall_back() {
+        let hints = vec![hint("old", "Urusei Yatsura", 1981, "Series")];
+        let error =
+            select_search_hint(&hints, "Urusei Yatsura", Some(2022), Some("Series")).unwrap_err();
+        assert!(error.to_string().contains("no Series item"));
+    }
+
+    #[test]
+    fn same_title_reboots_are_ambiguous_without_a_year() {
+        let hints = vec![
+            hint("new", "Urusei Yatsura", 2022, "Series"),
+            hint("old", "Urusei Yatsura", 1981, "Series"),
+        ];
+        let error = select_search_hint(&hints, "Urusei Yatsura", None, Some("Series")).unwrap_err();
+        assert!(error.to_string().contains("ambiguous match"));
+    }
+
+    #[test]
+    fn duplicate_encodes_of_the_same_work_resolve_stably() {
+        let hints = vec![
+            hint("z-copy", "Ghost in the Shell", 1995, "Movie"),
+            hint("a-copy", "Ghost in the Shell", 1995, "Movie"),
+        ];
+        let selected =
+            select_search_hint(&hints, "Ghost in the Shell", Some(1995), Some("Movie")).unwrap();
+        assert_eq!(selected.id, "a-copy");
+    }
+
+    #[test]
+    fn untyped_resolution_prefers_a_series_over_same_named_episodes() {
+        let hints = vec![
+            hint("episode", "Urusei Yatsura", 2022, "Episode"),
+            hint("series", "Urusei Yatsura", 2022, "Series"),
+        ];
+        let selected = select_search_hint(&hints, "Urusei Yatsura", Some(2022), None).unwrap();
+        assert_eq!(selected.id, "series");
+    }
+
+    #[test]
+    fn search_ranking_puts_exact_top_level_items_first() {
+        let mut hints = vec![
+            hint("episode", "Urusei Yatsura", 1981, "Episode"),
+            hint("partial", "Urusei Yatsura Movie", 1983, "Movie"),
+            hint("series", "Urusei Yatsura", 2022, "Series"),
+        ];
+        sort_search_hints(&mut hints, "Urusei Yatsura");
+        assert_eq!(
+            hints
+                .iter()
+                .map(|hint| hint.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["series", "episode", "partial"]
+        );
+    }
+}
