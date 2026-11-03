@@ -1,9 +1,11 @@
 mod api;
 mod config;
 mod display;
+mod program;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "jf", about = "Jellyfin CLI")]
@@ -32,7 +34,7 @@ enum Command {
     List {
         /// Library name or ID (omit to list all recent items)
         library: Option<String>,
-        /// Item type filter: movie, series, episode, audio, album, artist
+        /// Item type filter: movie, series, episode, audiobook, book, audio, album, artist, video, musicvideo, boxset, playlist, photo
         #[arg(short = 't', long)]
         r#type: Option<String>,
         /// Max results
@@ -51,7 +53,7 @@ enum Command {
         /// Filter by year (auto-detected from trailing year in query)
         #[arg(short, long)]
         year: Option<u32>,
-        /// Filter by type: movie, series, episode, audio, album, artist
+        /// Filter by type: movie, series, episode, audiobook, book, audio, album, artist, video, musicvideo, boxset, playlist, photo
         #[arg(short = 't', long)]
         r#type: Option<String>,
     },
@@ -102,13 +104,35 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
-    /// Play an item locally with mpv
+    /// Play an item locally with mpv (requests H.264 video for compatibility)
     Play {
         /// Item ID or name
         item: Vec<String>,
         /// Extra arguments passed to mpv
         #[arg(last = true)]
         mpv_args: Vec<String>,
+    },
+    /// Download media to a local directory with proper filenames
+    ///
+    /// `--parts` downloads every part/chapter of a book or collection (e.g.
+    /// every audiobook chapter) and writes an `m3u` playlist of the local
+    /// files alongside them.
+    Download {
+        /// Item ID or name
+        item: Vec<String>,
+        /// Download every part/chapter of the book or collection (and write
+        /// an m3u playlist of the local files)
+        #[arg(short, long)]
+        parts: bool,
+        /// Overwrite existing files (default: skip non-empty existing files)
+        #[arg(short, long)]
+        force: bool,
+        /// Item type filter (e.g. `audiobook`, `movie`, `audio`)
+        #[arg(short = 't', long)]
+        r#type: Option<String>,
+        /// Destination directory (default: current directory)
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
     },
     /// Remote-control playback on a device
     Remote {
@@ -167,6 +191,57 @@ enum Command {
         /// Series ID or name
         series: Vec<String>,
     },
+    /// List, inspect, create, and program playlists
+    Playlist {
+        #[command(subcommand)]
+        command: PlaylistCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaylistCommand {
+    /// List playlists visible to the current user
+    List,
+    /// Show the ordered items in a playlist
+    Show {
+        /// Playlist name or ID
+        playlist: String,
+    },
+    /// Create a playlist from item names or IDs
+    Create {
+        /// New playlist name
+        name: String,
+        /// Item names or IDs (quote names containing spaces)
+        #[arg(required = true)]
+        items: Vec<String>,
+        /// Make the playlist visible to other users
+        #[arg(long)]
+        public: bool,
+    },
+    /// Add items to the end of a playlist
+    Add {
+        /// Playlist name or ID
+        playlist: String,
+        /// Item names or IDs (quote names containing spaces)
+        #[arg(required = true)]
+        items: Vec<String>,
+    },
+    /// Replace a playlist's contents, preserving the playlist itself
+    Replace {
+        /// Playlist name or ID
+        playlist: String,
+        /// Item names or IDs (quote names containing spaces)
+        #[arg(required = true)]
+        items: Vec<String>,
+    },
+    /// Build or update long-form channels from a JSON programming config
+    Program {
+        /// Path to the programming config
+        file: PathBuf,
+        /// Resolve and preview the schedule without changing Jellyfin
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -176,12 +251,18 @@ async fn main() -> Result<()> {
         Command::Login { token, server } => cmd_login(token, server).await,
         Command::Status => cmd_status().await,
         Command::Libraries => cmd_libraries().await,
-        Command::List { library, r#type, limit, sort } => {
-            cmd_list(library, r#type, limit, sort).await
-        }
-        Command::Search { query, limit, year, r#type } => {
-            cmd_search(query.join(" "), limit, year, r#type).await
-        }
+        Command::List {
+            library,
+            r#type,
+            limit,
+            sort,
+        } => cmd_list(library, r#type, limit, sort).await,
+        Command::Search {
+            query,
+            limit,
+            year,
+            r#type,
+        } => cmd_search(query.join(" "), limit, year, r#type).await,
         Command::Info { item } => cmd_info(item.join(" ")).await,
         Command::Episodes { series, season } => cmd_episodes(series.join(" "), season).await,
         Command::Users => cmd_users().await,
@@ -192,17 +273,35 @@ async fn main() -> Result<()> {
         Command::Sessions => cmd_sessions().await,
         Command::Cast { item, to } => cmd_cast(item.join(" "), to).await,
         Command::Play { item, mpv_args } => cmd_play(item.join(" "), mpv_args).await,
-        Command::Remote { action, to, position } => cmd_remote(action, to, position).await,
+        Command::Download {
+            item,
+            parts,
+            force,
+            r#type,
+            dir,
+        } => cmd_download(item.join(" "), parts, force, r#type, dir).await,
+        Command::Remote {
+            action,
+            to,
+            position,
+        } => cmd_remote(action, to, position).await,
         Command::Scan { library } => cmd_scan(library).await,
-        Command::Refresh { item, metadata, images } => {
-            cmd_refresh(item.join(" "), metadata, images).await
-        }
-        Command::Identify { item, apply, replace_images, name, year } => {
-            cmd_identify(item.join(" "), apply, replace_images, name, year).await
-        }
+        Command::Refresh {
+            item,
+            metadata,
+            images,
+        } => cmd_refresh(item.join(" "), metadata, images).await,
+        Command::Identify {
+            item,
+            apply,
+            replace_images,
+            name,
+            year,
+        } => cmd_identify(item.join(" "), apply, replace_images, name, year).await,
         Command::Tasks => cmd_tasks().await,
         Command::RunTask { name } => cmd_run_task(name.join(" ")).await,
         Command::Missing { series } => cmd_missing(series.join(" ")).await,
+        Command::Playlist { command } => cmd_playlist(command).await,
     }
 }
 
@@ -266,7 +365,10 @@ async fn cmd_login(token: Option<String>, server: Option<String>) -> Result<()> 
 
 async fn cmd_status() -> Result<()> {
     let cfg = config::Config::load()?;
-    println!("Server: {}", colored::Colorize::cyan(cfg.server_url.as_str()));
+    println!(
+        "Server: {}",
+        colored::Colorize::cyan(cfg.server_url.as_str())
+    );
     match &cfg.access_token {
         Some(_) => {
             let client = api::Client::new(&cfg)?;
@@ -275,9 +377,7 @@ async fn cmd_status() -> Result<()> {
                     println!("Connected: {} v{}", info.server_name, info.version);
                     println!(
                         "User: {}",
-                        colored::Colorize::green(
-                            cfg.user_name.as_deref().unwrap_or("unknown")
-                        )
+                        colored::Colorize::green(cfg.user_name.as_deref().unwrap_or("unknown"))
                     );
                 }
                 Err(_) => {
@@ -355,12 +455,18 @@ async fn cmd_search(
     };
 
     let jf_type = item_type.as_deref().map(api::normalize_item_type);
-    let filtering = year_filter.is_some() || jf_type.is_some();
-    let api_limit = if filtering { limit.max(100) } else { limit };
+    let api_limit = if jf_type.is_some() {
+        limit.max(100)
+    } else {
+        // Mixed searches often return every matching episode before their
+        // parent series, so leave enough room to rank top-level items first.
+        limit.max(500)
+    };
 
-    let hints = client
+    let mut hints = client
         .search(&search_term, api_limit, jf_type.as_deref())
         .await?;
+    api::sort_search_hints(&mut hints, &search_term);
 
     let filtered: Vec<_> = hints
         .into_iter()
@@ -387,7 +493,9 @@ async fn cmd_info(item: String) -> Result<()> {
 async fn cmd_episodes(series: String, season: Option<u32>) -> Result<()> {
     let cfg = config::Config::load()?;
     let client = api::Client::new(&cfg)?;
-    let id = client.resolve_item_id(&series).await?;
+    let id = client
+        .resolve_item_id_of_type(&series, Some("Series"))
+        .await?;
 
     if let Some(season_num) = season {
         let episodes = client.episodes(&id, Some(season_num)).await?;
@@ -422,21 +530,23 @@ async fn cmd_url(item: String) -> Result<()> {
     let detail = client.item_detail(&id).await?;
 
     let token = cfg.access_token.as_deref().unwrap_or("");
-    let stream_url = format!(
-        "{}/Items/{}/Download?api_key={}",
-        cfg.server_url, id, token
-    );
+    let download_url = format!("{}/Items/{}/Download", cfg.server_url, id);
     println!("{}", colored::Colorize::bold("Download URL:"));
-    println!("  {}", stream_url);
+    println!("  {}", download_url);
 
-    if detail.item_type == "Episode" || detail.item_type == "Movie" {
-        let play_url = format!(
-            "{}/Videos/{}/stream?Static=true&api_key={}",
-            cfg.server_url, id, token
-        );
+    if let Some(stream_url) = api::item_stream_url(&cfg.server_url, &detail.item_type, &id) {
         println!("{}", colored::Colorize::bold("Stream URL:"));
-        println!("  {}", play_url);
+        println!("  {}", stream_url);
     }
+
+    // Jellyfin 12 rejects `?api_key=`; the token has to travel in a header.
+    println!();
+    println!("{}", colored::Colorize::bold("Required header:"));
+    println!("  {}", api::auth_header(token));
+    println!(
+        "  mpv --http-header-fields='{}' <url>",
+        api::auth_header(token)
+    );
     Ok(())
 }
 
@@ -460,7 +570,11 @@ async fn cmd_mark(item: String, mark_as: String) -> Result<()> {
         "unfavorite" => client.set_favorite(&id, false).await?,
         _ => unreachable!(),
     }
-    println!("Marked {} as {}", id, colored::Colorize::green(mark_as.as_str()));
+    println!(
+        "Marked {} as {}",
+        id,
+        colored::Colorize::green(mark_as.as_str())
+    );
     Ok(())
 }
 
@@ -501,6 +615,64 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
 
     let token = cfg.access_token.as_deref().unwrap_or("");
 
+    if detail.item_type == "BoxSet" {
+        let items = client
+            .items(Some(&id), None, 100_000, "SortName")
+            .await?
+            .items;
+        let playable = items
+            .iter()
+            .filter(|item| {
+                api::item_stream_url(&cfg.server_url, &item.item_type, &item.id).is_some()
+            })
+            .collect::<Vec<_>>();
+        if playable.is_empty() {
+            bail!("collection has no playable items");
+        }
+
+        let mut playlist = String::from("#EXTM3U\n");
+        for child in &playable {
+            let title = if child.item_type == "Episode" {
+                format!(
+                    "{} S{:02}E{:02} - {}",
+                    child.series_name.as_deref().unwrap_or(detail.name.as_str()),
+                    child.parent_index_number.unwrap_or(0),
+                    child.index_number.unwrap_or(0),
+                    child.name
+                )
+            } else {
+                child.name.clone()
+            };
+            let duration = child
+                .run_time_ticks
+                .map(|ticks| (ticks / 10_000_000) as i64)
+                .unwrap_or(-1);
+            let url = api::item_stream_url(&cfg.server_url, &child.item_type, &child.id)
+                .context("playable collection item has no stream URL")?;
+            playlist.push_str(&format!("#EXTINF:{},{}\n{}\n", duration, title, url));
+        }
+
+        let playlist_path = std::env::temp_dir().join(format!("jf-{}.m3u", id));
+        std::fs::write(&playlist_path, &playlist)?;
+        println!(
+            "Playing {} ({} items) with mpv...",
+            colored::Colorize::bold(detail.name.as_str()),
+            playable.len()
+        );
+
+        let status = std::process::Command::new("mpv")
+            .arg(format!("--playlist={}", playlist_path.display()))
+            .arg(api::mpv_auth_arg(token))
+            .args(&mpv_args)
+            .status()
+            .context("failed to launch mpv — is it installed?")?;
+        let _ = std::fs::remove_file(&playlist_path);
+        if !status.success() {
+            bail!("mpv exited with {}", status);
+        }
+        return Ok(());
+    }
+
     if detail.item_type == "Series" {
         let episodes = client.episodes(&id, None).await?;
         if episodes.items.is_empty() {
@@ -526,10 +698,7 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
                 .run_time_ticks
                 .map(|t| (t / 10_000_000) as i64)
                 .unwrap_or(-1);
-            let url = format!(
-                "{}/Videos/{}/stream?Static=true&api_key={}",
-                cfg.server_url, ep.id, token
-            );
+            let url = api::mpv_video_stream_url(&cfg.server_url, &ep.id);
             playlist.push_str(&format!("#EXTINF:{},{}\n{}\n", duration, ep_title, url));
         }
 
@@ -553,6 +722,7 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
         let status = std::process::Command::new("mpv")
             .arg(format!("--playlist={}", playlist_path.display()))
             .arg(format!("--playlist-start={}", start_index))
+            .arg(api::mpv_auth_arg(token))
             .args(&mpv_args)
             .status()
             .context("failed to launch mpv — is it installed?")?;
@@ -565,24 +735,22 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let url = match detail.item_type.as_str() {
-        "Episode" | "Movie" => format!(
-            "{}/Videos/{}/stream?Static=true&api_key={}",
-            cfg.server_url, id, token
-        ),
-        "Audio" => format!(
-            "{}/Audio/{}/stream?Static=true&api_key={}",
-            cfg.server_url, id, token
-        ),
-        _ => format!(
-            "{}/Items/{}/Download?api_key={}",
-            cfg.server_url, id, token
-        ),
-    };
+    let url = api::item_stream_url(&cfg.server_url, &detail.item_type, &id).with_context(|| {
+        format!(
+            "{} items cannot be played directly; use `jf url` for the download URL",
+            detail.item_type
+        )
+    })?;
 
     let title = if let Some(ref series) = detail.series_name {
-        let ep = detail.index_number.map(|e| format!("E{:02}", e)).unwrap_or_default();
-        let sn = detail.parent_index_number.map(|s| format!("S{:02}", s)).unwrap_or_default();
+        let ep = detail
+            .index_number
+            .map(|e| format!("E{:02}", e))
+            .unwrap_or_default();
+        let sn = detail
+            .parent_index_number
+            .map(|s| format!("S{:02}", s))
+            .unwrap_or_default();
         format!("{} {}{} - {}", series, sn, ep, detail.name)
     } else {
         detail.name.clone()
@@ -596,6 +764,7 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
     let status = std::process::Command::new("mpv")
         .arg(&url)
         .arg(format!("--force-media-title={}", title))
+        .arg(api::mpv_auth_arg(token))
         .args(&mpv_args)
         .status()
         .context("failed to launch mpv — is it installed?")?;
@@ -606,6 +775,195 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+
+fn safe_name(name: &str) -> String {
+    name.trim().replace('/', "-")
+}
+
+async fn cmd_download(
+    item: String,
+    parts: bool,
+    force: bool,
+    type_: Option<String>,
+    dir: Option<PathBuf>,
+) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+
+    // Resolve to (title, list of items to download).
+    let (title, mut to_download) = if parts {
+        let hints = client.search(&item, 100, type_.as_deref()).await?;
+        if hints.is_empty() {
+            let type_desc = type_
+                .as_deref()
+                .map(|t| format!(" of type {}", t))
+                .unwrap_or_default();
+            bail!("no{} item named '{}'", type_desc, item);
+        }
+        // The book is the highest-run-time match (the whole book / collection).
+        let book_id = hints
+            .iter()
+            .max_by_key(|h| h.run_time_ticks.unwrap_or(0))
+            .expect("hints non-empty")
+            .id
+            .clone();
+        let book = client.item_detail(&book_id).await?;
+        match book.item_type.as_str() {
+            "AudioBook" => {
+                let album = book
+                    .album
+                    .clone()
+                    .unwrap_or_else(|| book.name.clone());
+                (album.clone(), client.audio_books_by_album(&album).await?)
+            }
+            "Series" => (
+                book.name.clone(),
+                client.series_episodes(&book.id).await?,
+            ),
+            _ => {
+                if book.child_count.map_or(false, |c| c > 0) {
+                    (book.name.clone(), client.children(&book.id).await?)
+                } else {
+                    (book.name.clone(), vec![book])
+                }
+            }
+        }
+    } else {
+        let id = client.resolve_item_id(&item).await?;
+        let detail = client.item_detail(&id).await?;
+        (detail.name.clone(), vec![detail])
+    };
+
+    if to_download.is_empty() {
+        bail!("{} has no parts to download", title);
+    }
+
+
+    // Ensure parts are in playback order (season/episode or chapter number first).
+    to_download.sort_by_key(|p| {
+        (
+            p.parent_index_number,
+            p.index_number,
+            p.name.to_lowercase(),
+        )
+    });
+    // Multi-part downloads land in a sub-directory named after the book/collection.
+    let base_dir = match dir {
+        Some(d) => d,
+        None => std::env::current_dir()?,
+    };
+    let dest_dir = if to_download.len() > 1 {
+        base_dir.join(safe_name(&title))
+    } else {
+        base_dir
+    };
+    std::fs::create_dir_all(&dest_dir)?;
+
+    // Media format is uniform across a book's parts; read it from the first part.
+    let first = client.item_detail(&to_download[0].id).await?;
+    let ext = first
+        .media_sources
+        .as_deref()
+        .and_then(|sources| sources.first().and_then(|ms| ms.container.as_deref()))
+        .map(str::to_string)
+        .unwrap_or_else(|| "mp3".to_string());
+
+    // Pre-compute collision-free filenames.
+    let mut used = std::collections::HashSet::new();
+    let mut fnames: Vec<String> = Vec::with_capacity(to_download.len());
+    for p in &to_download {
+        let mut n = 0;
+        let stem = safe_name(&p.name);
+        let mut fname = format!("{}.{}", stem, ext);
+        while !used.insert(fname.clone()) {
+            n += 1;
+            fname = format!("{} ({}).{}", stem, n, ext);
+        }
+        fnames.push(fname);
+    }
+
+    println!(
+        "Downloading {} part(s) of {} to {}",
+        to_download.len(),
+        title,
+        dest_dir.display()
+    );
+    let single = to_download.len() == 1;
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    for (p, fname) in to_download.iter().zip(fnames.iter()) {
+        let path = dest_dir.join(fname);
+        let already = path
+            .metadata()
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        if !force && already {
+            println!("  skip  {}", p.name);
+            skipped += 1;
+            continue;
+        }
+        let bytes = match client
+            .download_bytes(&format!("/Items/{}/Download", p.id))
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                if single {
+                    return Err(e);
+                }
+                failed += 1;
+                println!("  warn  {} ({})", p.name, e);
+                continue;
+            }
+        };
+        if std::fs::write(&path, &bytes).is_err() {
+            if single {
+                return Err(anyhow::anyhow!("failed to write {}", path.display()));
+            }
+            failed += 1;
+            println!("  warn  {} (write failed)", p.name);
+            continue;
+        }
+        downloaded += 1;
+        println!(
+            "  saved  {:>8.1} MB  {}",
+            bytes.len() as f64 / 1_000_000.0,
+            p.name
+        );
+    }
+
+    if to_download.len() > 1 {
+        let mut m3u = String::from("#EXTM3U\n");
+        for (p, fname) in to_download.iter().zip(fnames.iter()) {
+            let dur = p
+                .run_time_ticks
+                .map(|t| (t / 10_000_000) as i64)
+                .unwrap_or(-1);
+            m3u.push_str(&format!("#EXTINF:{},{}\n", dur, p.name));
+            m3u.push_str(&format!("{}\n", fname));
+        }
+        let playlist = dest_dir.join(format!("{}.m3u", safe_name(&title)));
+        std::fs::write(&playlist, &m3u)?;
+        let playlist_display = playlist.display().to_string();
+        println!(
+            "Playlist: {}",
+            colored::Colorize::cyan(playlist_display.as_str())
+        );
+    }
+
+    let mut summary = format!(
+        "{}: downloaded {}, skipped {}",
+        safe_name(&title),
+        downloaded,
+        skipped
+    );
+    if failed > 0 {
+        summary.push_str(format!(", {} failed", failed).as_str());
+    }
+    println!("{}", colored::Colorize::green(summary.as_str()));
+    Ok(())
+}
 async fn cmd_remote(action: String, to: Option<String>, position: Option<u64>) -> Result<()> {
     let cfg = config::Config::load()?;
     let client = api::Client::new(&cfg)?;
@@ -623,7 +981,9 @@ async fn cmd_remote(action: String, to: Option<String>, position: Option<u64>) -
         _ => unreachable!(),
     };
 
-    client.playstate_command(&session.id, command, ticks).await?;
+    client
+        .playstate_command(&session.id, command, ticks)
+        .await?;
 
     let device = session
         .device_name
@@ -645,7 +1005,9 @@ async fn cmd_scan(library: Option<String>) -> Result<()> {
     match library {
         Some(name) => {
             let id = client.resolve_library_id(&name).await?;
-            client.refresh_item(&id, "Default", "Default", false, false).await?;
+            client
+                .refresh_item(&id, "Default", "Default", false, false)
+                .await?;
             println!(
                 "Triggered rescan for {}",
                 colored::Colorize::green(name.as_str())
@@ -709,8 +1071,13 @@ async fn cmd_identify(
         let chosen = results
             .get(index - 1)
             .with_context(|| format!("no result at index {}", index))?;
-        client.apply_remote_search(&id, chosen, replace_images).await?;
-        let chosen_name = chosen.get("Name").and_then(|v| v.as_str()).unwrap_or("match");
+        client
+            .apply_remote_search(&id, chosen, replace_images)
+            .await?;
+        let chosen_name = chosen
+            .get("Name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("match");
         println!(
             "Applied {} to {}",
             colored::Colorize::green(chosen_name),
@@ -778,7 +1145,9 @@ async fn cmd_run_task(name: String) -> Result<()> {
 async fn cmd_missing(series: String) -> Result<()> {
     let cfg = config::Config::load()?;
     let client = api::Client::new(&cfg)?;
-    let id = client.resolve_item_id(&series).await?;
+    let id = client
+        .resolve_item_id_of_type(&series, Some("Series"))
+        .await?;
     let detail = client.item_detail(&id).await?;
     let episodes = client.episodes(&id, None).await?;
 
@@ -803,4 +1172,165 @@ async fn cmd_missing(series: String) -> Result<()> {
     );
     display::print_items(&missing, &cfg.server_url);
     Ok(())
+}
+
+async fn cmd_playlist(command: PlaylistCommand) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+
+    match command {
+        PlaylistCommand::List => {
+            let playlists = client.playlists().await?;
+            if playlists.items.is_empty() {
+                println!("{}", colored::Colorize::yellow("No playlists found."));
+            } else {
+                display::print_items(&playlists.items, &cfg.server_url);
+            }
+        }
+        PlaylistCommand::Show { playlist } => {
+            let id = client.resolve_playlist_id(&playlist).await?;
+            let detail = client.item_detail(&id).await?;
+            let items = client.playlist_items(&id).await?;
+            println!(
+                "{} ({} items, {:.1} hours)",
+                colored::Colorize::bold(detail.name.as_str()),
+                items.items.len(),
+                program::ticks_to_hours(
+                    items
+                        .items
+                        .iter()
+                        .filter_map(|item| item.run_time_ticks)
+                        .sum()
+                )
+            );
+            display::print_items(&items.items, &cfg.server_url);
+        }
+        PlaylistCommand::Create {
+            name,
+            items,
+            public,
+        } => {
+            if client
+                .playlists()
+                .await?
+                .items
+                .iter()
+                .any(|playlist| playlist.name.eq_ignore_ascii_case(&name))
+            {
+                bail!(
+                    "playlist '{}' already exists; use `jf playlist replace`",
+                    name
+                );
+            }
+            let ids = resolve_item_ids(&client, &items).await?;
+            let id = client.create_playlist(&name, &ids, public).await?;
+            println!(
+                "Created {} with {} items ({})",
+                colored::Colorize::green(name.as_str()),
+                ids.len(),
+                id
+            );
+        }
+        PlaylistCommand::Add { playlist, items } => {
+            let playlist_id = client.resolve_playlist_id(&playlist).await?;
+            let ids = resolve_item_ids(&client, &items).await?;
+            client.add_playlist_items(&playlist_id, &ids).await?;
+            println!(
+                "Added {} items to {}",
+                ids.len(),
+                colored::Colorize::green(playlist.as_str())
+            );
+        }
+        PlaylistCommand::Replace { playlist, items } => {
+            let playlist_id = client.resolve_playlist_id(&playlist).await?;
+            let ids = resolve_item_ids(&client, &items).await?;
+            client.replace_playlist_items(&playlist_id, &ids).await?;
+            println!(
+                "Replaced {} with {} items",
+                colored::Colorize::green(playlist.as_str()),
+                ids.len()
+            );
+        }
+        PlaylistCommand::Program { file, dry_run } => {
+            let config = program::ProgramConfig::load(&file)?;
+            let mut channels = Vec::with_capacity(config.channels.len());
+
+            println!(
+                "Building {} channel schedules from {}...",
+                config.channels.len(),
+                file.display()
+            );
+            for spec in &config.channels {
+                let channel = program::build_channel(&client, spec).await?;
+                let hours = program::ticks_to_hours(channel.duration_ticks);
+                println!(
+                    "  {}: {} items, {} series, {} movies, {:.1} hours{}",
+                    colored::Colorize::bold(channel.name.as_str()),
+                    channel.items.len(),
+                    channel.series_count,
+                    channel.movie_count,
+                    hours,
+                    if hours + 0.01 < spec.target_hours {
+                        " (library content exhausted before target)"
+                    } else {
+                        ""
+                    }
+                );
+                channels.push(channel);
+            }
+
+            if dry_run {
+                println!(
+                    "{}",
+                    colored::Colorize::yellow("Dry run: Jellyfin was not changed.")
+                );
+                return Ok(());
+            }
+
+            let existing = client.playlists().await?.items;
+            for channel in channels {
+                let item_ids = channel
+                    .items
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>();
+                if let Some(playlist) = existing
+                    .iter()
+                    .find(|playlist| playlist.name.eq_ignore_ascii_case(&channel.name))
+                {
+                    client
+                        .replace_playlist_items(&playlist.id, &item_ids)
+                        .await?;
+                    println!(
+                        "Updated {} in place",
+                        colored::Colorize::green(channel.name.as_str())
+                    );
+                } else {
+                    let id = client
+                        .create_playlist(&channel.name, &item_ids, false)
+                        .await?;
+                    println!(
+                        "Created {} ({})",
+                        colored::Colorize::green(channel.name.as_str()),
+                        id
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn resolve_item_ids(client: &api::Client, items: &[String]) -> Result<Vec<String>> {
+    let mut ids = Vec::with_capacity(items.len());
+    for item in items {
+        ids.push(
+            client
+                .resolve_item_id(item)
+                .await
+                .with_context(|| format!("could not resolve playlist item '{}'", item))?,
+        );
+    }
+    Ok(ids)
 }
