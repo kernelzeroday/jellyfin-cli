@@ -34,7 +34,7 @@ enum Command {
     List {
         /// Library name or ID (omit to list all recent items)
         library: Option<String>,
-        /// Item type filter: movie, series, episode, audio, album, artist
+        /// Item type filter: movie, series, episode, audiobook, book, audio, album, artist, video, musicvideo, boxset, playlist, photo
         #[arg(short = 't', long)]
         r#type: Option<String>,
         /// Max results
@@ -53,7 +53,7 @@ enum Command {
         /// Filter by year (auto-detected from trailing year in query)
         #[arg(short, long)]
         year: Option<u32>,
-        /// Filter by type: movie, series, episode, audio, album, artist
+        /// Filter by type: movie, series, episode, audiobook, book, audio, album, artist, video, musicvideo, boxset, playlist, photo
         #[arg(short = 't', long)]
         r#type: Option<String>,
     },
@@ -104,7 +104,7 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
     },
-    /// Play an item locally with mpv
+    /// Play an item locally with mpv (requests H.264 video for compatibility)
     Play {
         /// Item ID or name
         item: Vec<String>,
@@ -501,14 +501,13 @@ async fn cmd_url(item: String) -> Result<()> {
     let detail = client.item_detail(&id).await?;
 
     let token = cfg.access_token.as_deref().unwrap_or("");
-    let stream_url = format!("{}/Items/{}/Download", cfg.server_url, id);
+    let download_url = format!("{}/Items/{}/Download", cfg.server_url, id);
     println!("{}", colored::Colorize::bold("Download URL:"));
-    println!("  {}", stream_url);
+    println!("  {}", download_url);
 
-    if detail.item_type == "Episode" || detail.item_type == "Movie" {
-        let play_url = format!("{}/Videos/{}/stream?Static=true", cfg.server_url, id);
+    if let Some(stream_url) = api::item_stream_url(&cfg.server_url, &detail.item_type, &id) {
         println!("{}", colored::Colorize::bold("Stream URL:"));
-        println!("  {}", play_url);
+        println!("  {}", stream_url);
     }
 
     // Jellyfin 12 rejects `?api_key=`; the token has to travel in a header.
@@ -587,6 +586,64 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
 
     let token = cfg.access_token.as_deref().unwrap_or("");
 
+    if detail.item_type == "BoxSet" {
+        let items = client
+            .items(Some(&id), None, 100_000, "SortName")
+            .await?
+            .items;
+        let playable = items
+            .iter()
+            .filter(|item| {
+                api::item_stream_url(&cfg.server_url, &item.item_type, &item.id).is_some()
+            })
+            .collect::<Vec<_>>();
+        if playable.is_empty() {
+            bail!("collection has no playable items");
+        }
+
+        let mut playlist = String::from("#EXTM3U\n");
+        for child in &playable {
+            let title = if child.item_type == "Episode" {
+                format!(
+                    "{} S{:02}E{:02} - {}",
+                    child.series_name.as_deref().unwrap_or(detail.name.as_str()),
+                    child.parent_index_number.unwrap_or(0),
+                    child.index_number.unwrap_or(0),
+                    child.name
+                )
+            } else {
+                child.name.clone()
+            };
+            let duration = child
+                .run_time_ticks
+                .map(|ticks| (ticks / 10_000_000) as i64)
+                .unwrap_or(-1);
+            let url = api::item_stream_url(&cfg.server_url, &child.item_type, &child.id)
+                .context("playable collection item has no stream URL")?;
+            playlist.push_str(&format!("#EXTINF:{},{}\n{}\n", duration, title, url));
+        }
+
+        let playlist_path = std::env::temp_dir().join(format!("jf-{}.m3u", id));
+        std::fs::write(&playlist_path, &playlist)?;
+        println!(
+            "Playing {} ({} items) with mpv...",
+            colored::Colorize::bold(detail.name.as_str()),
+            playable.len()
+        );
+
+        let status = std::process::Command::new("mpv")
+            .arg(format!("--playlist={}", playlist_path.display()))
+            .arg(api::mpv_auth_arg(token))
+            .args(&mpv_args)
+            .status()
+            .context("failed to launch mpv — is it installed?")?;
+        let _ = std::fs::remove_file(&playlist_path);
+        if !status.success() {
+            bail!("mpv exited with {}", status);
+        }
+        return Ok(());
+    }
+
     if detail.item_type == "Series" {
         let episodes = client.episodes(&id, None).await?;
         if episodes.items.is_empty() {
@@ -612,7 +669,7 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
                 .run_time_ticks
                 .map(|t| (t / 10_000_000) as i64)
                 .unwrap_or(-1);
-            let url = format!("{}/Videos/{}/stream?Static=true", cfg.server_url, ep.id);
+            let url = api::mpv_video_stream_url(&cfg.server_url, &ep.id);
             playlist.push_str(&format!("#EXTINF:{},{}\n{}\n", duration, ep_title, url));
         }
 
@@ -649,11 +706,12 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let url = match detail.item_type.as_str() {
-        "Episode" | "Movie" => format!("{}/Videos/{}/stream?Static=true", cfg.server_url, id),
-        "Audio" => format!("{}/Audio/{}/stream?Static=true", cfg.server_url, id),
-        _ => format!("{}/Items/{}/Download", cfg.server_url, id),
-    };
+    let url = api::item_stream_url(&cfg.server_url, &detail.item_type, &id).with_context(|| {
+        format!(
+            "{} items cannot be played directly; use `jf url` for the download URL",
+            detail.item_type
+        )
+    })?;
 
     let title = if let Some(ref series) = detail.series_name {
         let ep = detail

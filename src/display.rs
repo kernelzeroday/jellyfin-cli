@@ -152,6 +152,7 @@ pub fn print_item_detail(item: &Item, server_url: &str) {
             "MusicAlbum" => "Tracks",
             "MusicArtist" => "Albums",
             "BoxSet" => "Items",
+            "AudioBook" => "Chapters",
             _ => "Children",
         };
         println!("  {}: {}", label, count);
@@ -241,10 +242,11 @@ pub fn print_item_detail(item: &Item, server_url: &str) {
     }
 
     println!("\n  ID: {}", item.id.dimmed());
-    println!(
-        "  Stream: {}/Videos/{}/stream?Static=true",
-        server_url, item.id
-    );
+    if let Some(stream_url) = crate::api::item_stream_url(server_url, &item.item_type, &item.id) {
+        println!("  Stream: {}", stream_url);
+    } else {
+        println!("  Download: {}/Items/{}/Download", server_url, item.id);
+    }
     println!("  Auth:   Authorization: MediaBrowser Token=\"<token>\"");
     println!();
 }
@@ -360,13 +362,18 @@ fn format_type_tag(t: &str) -> String {
         "Season" => ("SEA", "magenta"),
         "Episode" => ("EP ", "cyan"),
         "Audio" => ("AUD", "green"),
+        "AudioBook" => ("ABK", "yellow"),
         "MusicAlbum" => ("ALB", "green"),
         "MusicArtist" => ("ART", "green"),
+        "MusicVideo" => ("MVD", "blue"),
+        "Video" => ("VID", "blue"),
         "Book" => ("BOK", "yellow"),
         "BoxSet" => ("SET", "red"),
         "Playlist" => ("PLY", "yellow"),
         "Person" => ("PER", "white"),
-        _ => ("???", "white"),
+        "Photo" => ("IMG", "white"),
+        "Folder" => ("DIR", "white"),
+        _ => return format!("[{}]", t),
     };
     let s = format!("[{}]", label);
     match color {

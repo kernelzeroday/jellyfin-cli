@@ -259,16 +259,40 @@ pub struct PlaylistCreationResult {
 }
 
 pub fn normalize_item_type(t: &str) -> String {
-    match t.to_lowercase().as_str() {
+    let normalized: String = t
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect();
+
+    match normalized.as_str() {
         "movie" | "movies" => "Movie",
         "series" | "show" | "shows" => "Series",
+        "season" | "seasons" => "Season",
         "episode" | "episodes" => "Episode",
         "audio" | "song" | "songs" | "track" | "tracks" => "Audio",
-        "album" | "albums" => "MusicAlbum",
-        "artist" | "artists" => "MusicArtist",
+        "audiobook" | "audiobooks" => "AudioBook",
+        "album" | "albums" | "musicalbum" | "musicalbums" => "MusicAlbum",
+        "artist" | "artists" | "musicartist" | "musicartists" => "MusicArtist",
+        "musicvideo" | "musicvideos" => "MusicVideo",
+        "video" | "videos" | "homevideo" | "homevideos" => "Video",
         "book" | "books" => "Book",
-        "boxset" | "collection" => "BoxSet",
-        other => other,
+        "boxset" | "boxsets" | "collection" | "collections" => "BoxSet",
+        "playlist" | "playlists" => "Playlist",
+        "photo" | "photos" | "image" | "images" => "Photo",
+        "folder" | "folders" => "Folder",
+        "channel" | "channels" => "Channel",
+        "tvchannel" | "tvchannels" => "TvChannel",
+        "tvprogram" | "tvprograms" => "TvProgram",
+        "program" | "programs" => "Program",
+        "trailer" | "trailers" => "Trailer",
+        "person" | "people" => "Person",
+        "genre" | "genres" => "Genre",
+        "musicgenre" | "musicgenres" => "MusicGenre",
+        "studio" | "studios" => "Studio",
+        "collectionfolder" => "CollectionFolder",
+        "userview" | "userviews" => "UserView",
+        _ => return t.to_string(),
     }
     .to_string()
 }
@@ -297,6 +321,27 @@ pub fn auth_header(token: &str) -> String {
 /// including the entries of a playlist.
 pub fn mpv_auth_arg(token: &str) -> String {
     format!("--http-header-fields={}", auth_header(token))
+}
+
+/// Build an H.264 baseline URL requesting full-resolution server transcodes for mpv.
+pub fn mpv_video_stream_url(server_url: &str, item_id: &str) -> String {
+    format!(
+        "{}/Videos/{}/stream?Container=ts&VideoCodec=h264&AudioCodec=aac&Profile=baseline&AllowVideoStreamCopy=false&MaxWidth=3840&MaxHeight=2160&VideoBitRate=40000000",
+        server_url, item_id
+    )
+}
+
+pub fn item_stream_url(server_url: &str, item_type: &str, item_id: &str) -> Option<String> {
+    match item_type {
+        "Movie" | "Episode" | "Video" | "MusicVideo" => {
+            Some(mpv_video_stream_url(server_url, item_id))
+        }
+        "Audio" | "AudioBook" => Some(format!(
+            "{}/Audio/{}/stream?Static=true",
+            server_url, item_id
+        )),
+        _ => None,
+    }
 }
 
 impl Client {
@@ -980,7 +1025,7 @@ fn normalized_search_name(name: &str) -> String {
 fn search_type_rank(item_type: &str) -> u8 {
     match item_type {
         "Series" | "Movie" | "MusicAlbum" | "MusicArtist" | "BoxSet" | "Playlist" => 0,
-        "Episode" | "Audio" | "Video" | "Book" => 1,
+        "Episode" | "Audio" | "AudioBook" | "Video" | "MusicVideo" | "Book" => 1,
         _ => 2,
     }
 }
@@ -1086,7 +1131,10 @@ fn select_search_hint<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchHint, extract_trailing_year, select_search_hint, sort_search_hints};
+    use super::{
+        SearchHint, extract_trailing_year, item_stream_url, mpv_video_stream_url,
+        normalize_item_type, select_search_hint, sort_search_hints,
+    };
 
     fn hint(id: &str, name: &str, year: u32, item_type: &str) -> SearchHint {
         SearchHint {
@@ -1097,6 +1145,42 @@ mod tests {
             series: None,
             run_time_ticks: None,
         }
+    }
+
+    #[test]
+    fn mpv_stream_url_requests_h264_transcoding() {
+        assert_eq!(
+            mpv_video_stream_url("http://jellyfin.local", "item-id"),
+            "http://jellyfin.local/Videos/item-id/stream?Container=ts&VideoCodec=h264&AudioCodec=aac&Profile=baseline&AllowVideoStreamCopy=false&MaxWidth=3840&MaxHeight=2160&VideoBitRate=40000000"
+        );
+    }
+
+    #[test]
+    fn normalizes_audiobook_and_library_section_names() {
+        assert_eq!(normalize_item_type("AUDIOBOOKS"), "AudioBook");
+        assert_eq!(normalize_item_type("audio books"), "AudioBook");
+        assert_eq!(normalize_item_type("home videos"), "Video");
+        assert_eq!(normalize_item_type("MUSIC VIDEO"), "MusicVideo");
+        assert_eq!(normalize_item_type("photos"), "Photo");
+        assert_eq!(normalize_item_type("books"), "Book");
+    }
+
+    #[test]
+    fn item_stream_urls_cover_audio_and_video_types() {
+        assert_eq!(
+            item_stream_url("http://jellyfin.local", "AudioBook", "book-id").as_deref(),
+            Some("http://jellyfin.local/Audio/book-id/stream?Static=true")
+        );
+        assert_eq!(
+            item_stream_url("http://jellyfin.local", "Video", "video-id").as_deref(),
+            Some(
+                "http://jellyfin.local/Videos/video-id/stream?Container=ts&VideoCodec=h264&AudioCodec=aac&Profile=baseline&AllowVideoStreamCopy=false&MaxWidth=3840&MaxHeight=2160&VideoBitRate=40000000"
+            )
+        );
+        assert_eq!(
+            item_stream_url("http://jellyfin.local", "Book", "book-id"),
+            None
+        );
     }
 
     #[test]
