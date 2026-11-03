@@ -99,6 +99,8 @@ pub struct Item {
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
     pub container: Option<String>,
     #[serde(default)]
     pub media_sources: Option<Vec<MediaSource>>,
@@ -404,6 +406,18 @@ impl Client {
             .header("Authorization", self.authorization())
     }
 
+    /// Download the raw media bytes from a server endpoint.
+    pub async fn download_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let bytes = self
+            .get(path)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(bytes.to_vec())
+    }
+
     // --- Quick Connect ---
 
     pub async fn quick_connect_initiate(&self) -> Result<QuickConnectResult> {
@@ -560,6 +574,101 @@ impl Client {
             .error_for_status()?
             .json()
             .await?)
+    }
+
+    /// Every audio book item (chapters and whole books), light fields only.
+    pub async fn audio_books(&self) -> Result<Vec<Item>> {
+        let r: ItemsResult = self
+            .get("/Items?IncludeItemTypes=AudioBook&Limit=100000&Fields=Id,Name,Type,Album,IndexNumber,ParentIndexNumber,RunTimeTicks")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(r.items)
+    }
+
+    /// All chapters of one audio book: every audio book sharing the given album,
+    /// minus the whole-book items (whose name equals the album). Ordered by
+    /// (parent index, index, name) so chapters play in sequence.
+    pub async fn audio_books_by_album(&self, album: &str) -> Result<Vec<Item>> {
+        let mut parts = self
+            .audio_books()
+            .await?
+            .into_iter()
+            .filter(|p| p.album.as_deref() == Some(album))
+            .filter(|p| normalized_search_name(&p.name) != normalized_search_name(album))
+            .collect::<Vec<_>>();
+        parts.sort_by_key(|p| {
+            (
+                p.parent_index_number,
+                p.index_number,
+                p.name.to_lowercase(),
+            )
+        });
+        Ok(parts)
+    }
+
+    /// Every child of an item, used to gather a collection's parts. Light fields only.
+    pub async fn children(&self, parent_id: &str) -> Result<Vec<Item>> {
+        let r: ItemsResult = self
+            .get(&format!(
+                "/Items?ParentId={}&Limit=100000&Fields=Id,Name,Type,Album,IndexNumber,ParentIndexNumber,RunTimeTicks&SortBy=SortName&SortOrder=Ascending",
+                parent_id
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(r.items)
+    }
+
+    /// All episodes of a series. On this server episodes live one level under
+    /// `Season` items (rather than directly under the series), so gather both
+    /// any direct episodes and the episodes under each season.
+    pub async fn series_episodes(&self, series_id: &str) -> Result<Vec<Item>> {
+        let fields = "Id,Name,Type,Album,IndexNumber,ParentIndexNumber,RunTimeTicks";
+        let r: ItemsResult = self
+            .get(&format!(
+                "/Items?ParentId={}&Limit=100000&Fields={}",
+                series_id, fields
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut eps: Vec<Item> = Vec::new();
+        let mut seasons: Vec<Item> = Vec::new();
+        for c in r.items {
+            match c.item_type.as_str() {
+                "Episode" => eps.push(c),
+                "Season" => seasons.push(c),
+                _ => {}
+            }
+        }
+        for season in seasons {
+            let s: ItemsResult = self
+                .get(&format!(
+                    "/Items?ParentId={}&IncludeItemTypes=Episode&Limit=100000&Fields={}",
+                    season.id, fields
+                ))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            eps.extend(s.items);
+        }
+        eps.sort_by_key(|p| {
+            (
+                p.parent_index_number,
+                p.index_number,
+                p.name.to_lowercase(),
+            )
+        });
+        Ok(eps)
     }
 
     pub async fn resolve_item_id(&self, input: &str) -> Result<String> {

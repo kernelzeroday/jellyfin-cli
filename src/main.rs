@@ -112,6 +112,28 @@ enum Command {
         #[arg(last = true)]
         mpv_args: Vec<String>,
     },
+    /// Download media to a local directory with proper filenames
+    ///
+    /// `--parts` downloads every part/chapter of a book or collection (e.g.
+    /// every audiobook chapter) and writes an `m3u` playlist of the local
+    /// files alongside them.
+    Download {
+        /// Item ID or name
+        item: Vec<String>,
+        /// Download every part/chapter of the book or collection (and write
+        /// an m3u playlist of the local files)
+        #[arg(short, long)]
+        parts: bool,
+        /// Overwrite existing files (default: skip non-empty existing files)
+        #[arg(short, long)]
+        force: bool,
+        /// Item type filter (e.g. `audiobook`, `movie`, `audio`)
+        #[arg(short = 't', long)]
+        r#type: Option<String>,
+        /// Destination directory (default: current directory)
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
     /// Remote-control playback on a device
     Remote {
         /// Action to send
@@ -251,6 +273,13 @@ async fn main() -> Result<()> {
         Command::Sessions => cmd_sessions().await,
         Command::Cast { item, to } => cmd_cast(item.join(" "), to).await,
         Command::Play { item, mpv_args } => cmd_play(item.join(" "), mpv_args).await,
+        Command::Download {
+            item,
+            parts,
+            force,
+            r#type,
+            dir,
+        } => cmd_download(item.join(" "), parts, force, r#type, dir).await,
         Command::Remote {
             action,
             to,
@@ -746,6 +775,195 @@ async fn cmd_play(item: String, mpv_args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+
+fn safe_name(name: &str) -> String {
+    name.trim().replace('/', "-")
+}
+
+async fn cmd_download(
+    item: String,
+    parts: bool,
+    force: bool,
+    type_: Option<String>,
+    dir: Option<PathBuf>,
+) -> Result<()> {
+    let cfg = config::Config::load()?;
+    let client = api::Client::new(&cfg)?;
+
+    // Resolve to (title, list of items to download).
+    let (title, mut to_download) = if parts {
+        let hints = client.search(&item, 100, type_.as_deref()).await?;
+        if hints.is_empty() {
+            let type_desc = type_
+                .as_deref()
+                .map(|t| format!(" of type {}", t))
+                .unwrap_or_default();
+            bail!("no{} item named '{}'", type_desc, item);
+        }
+        // The book is the highest-run-time match (the whole book / collection).
+        let book_id = hints
+            .iter()
+            .max_by_key(|h| h.run_time_ticks.unwrap_or(0))
+            .expect("hints non-empty")
+            .id
+            .clone();
+        let book = client.item_detail(&book_id).await?;
+        match book.item_type.as_str() {
+            "AudioBook" => {
+                let album = book
+                    .album
+                    .clone()
+                    .unwrap_or_else(|| book.name.clone());
+                (album.clone(), client.audio_books_by_album(&album).await?)
+            }
+            "Series" => (
+                book.name.clone(),
+                client.series_episodes(&book.id).await?,
+            ),
+            _ => {
+                if book.child_count.map_or(false, |c| c > 0) {
+                    (book.name.clone(), client.children(&book.id).await?)
+                } else {
+                    (book.name.clone(), vec![book])
+                }
+            }
+        }
+    } else {
+        let id = client.resolve_item_id(&item).await?;
+        let detail = client.item_detail(&id).await?;
+        (detail.name.clone(), vec![detail])
+    };
+
+    if to_download.is_empty() {
+        bail!("{} has no parts to download", title);
+    }
+
+
+    // Ensure parts are in playback order (season/episode or chapter number first).
+    to_download.sort_by_key(|p| {
+        (
+            p.parent_index_number,
+            p.index_number,
+            p.name.to_lowercase(),
+        )
+    });
+    // Multi-part downloads land in a sub-directory named after the book/collection.
+    let base_dir = match dir {
+        Some(d) => d,
+        None => std::env::current_dir()?,
+    };
+    let dest_dir = if to_download.len() > 1 {
+        base_dir.join(safe_name(&title))
+    } else {
+        base_dir
+    };
+    std::fs::create_dir_all(&dest_dir)?;
+
+    // Media format is uniform across a book's parts; read it from the first part.
+    let first = client.item_detail(&to_download[0].id).await?;
+    let ext = first
+        .media_sources
+        .as_deref()
+        .and_then(|sources| sources.first().and_then(|ms| ms.container.as_deref()))
+        .map(str::to_string)
+        .unwrap_or_else(|| "mp3".to_string());
+
+    // Pre-compute collision-free filenames.
+    let mut used = std::collections::HashSet::new();
+    let mut fnames: Vec<String> = Vec::with_capacity(to_download.len());
+    for p in &to_download {
+        let mut n = 0;
+        let stem = safe_name(&p.name);
+        let mut fname = format!("{}.{}", stem, ext);
+        while !used.insert(fname.clone()) {
+            n += 1;
+            fname = format!("{} ({}).{}", stem, n, ext);
+        }
+        fnames.push(fname);
+    }
+
+    println!(
+        "Downloading {} part(s) of {} to {}",
+        to_download.len(),
+        title,
+        dest_dir.display()
+    );
+    let single = to_download.len() == 1;
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    for (p, fname) in to_download.iter().zip(fnames.iter()) {
+        let path = dest_dir.join(fname);
+        let already = path
+            .metadata()
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        if !force && already {
+            println!("  skip  {}", p.name);
+            skipped += 1;
+            continue;
+        }
+        let bytes = match client
+            .download_bytes(&format!("/Items/{}/Download", p.id))
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                if single {
+                    return Err(e);
+                }
+                failed += 1;
+                println!("  warn  {} ({})", p.name, e);
+                continue;
+            }
+        };
+        if std::fs::write(&path, &bytes).is_err() {
+            if single {
+                return Err(anyhow::anyhow!("failed to write {}", path.display()));
+            }
+            failed += 1;
+            println!("  warn  {} (write failed)", p.name);
+            continue;
+        }
+        downloaded += 1;
+        println!(
+            "  saved  {:>8.1} MB  {}",
+            bytes.len() as f64 / 1_000_000.0,
+            p.name
+        );
+    }
+
+    if to_download.len() > 1 {
+        let mut m3u = String::from("#EXTM3U\n");
+        for (p, fname) in to_download.iter().zip(fnames.iter()) {
+            let dur = p
+                .run_time_ticks
+                .map(|t| (t / 10_000_000) as i64)
+                .unwrap_or(-1);
+            m3u.push_str(&format!("#EXTINF:{},{}\n", dur, p.name));
+            m3u.push_str(&format!("{}\n", fname));
+        }
+        let playlist = dest_dir.join(format!("{}.m3u", safe_name(&title)));
+        std::fs::write(&playlist, &m3u)?;
+        let playlist_display = playlist.display().to_string();
+        println!(
+            "Playlist: {}",
+            colored::Colorize::cyan(playlist_display.as_str())
+        );
+    }
+
+    let mut summary = format!(
+        "{}: downloaded {}, skipped {}",
+        safe_name(&title),
+        downloaded,
+        skipped
+    );
+    if failed > 0 {
+        summary.push_str(format!(", {} failed", failed).as_str());
+    }
+    println!("{}", colored::Colorize::green(summary.as_str()));
+    Ok(())
+}
 async fn cmd_remote(action: String, to: Option<String>, position: Option<u64>) -> Result<()> {
     let cfg = config::Config::load()?;
     let client = api::Client::new(&cfg)?;
